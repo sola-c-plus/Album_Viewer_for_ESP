@@ -11,8 +11,10 @@ import android.graphics.Paint
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
 import android.net.Uri
 import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import android.util.Log
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.CoroutineScope
@@ -33,7 +35,8 @@ class MediaListenerService : NotificationListenerService() {
 
     private var sessionManager: MediaSessionManager? = null
     private val activeControllers = mutableListOf<MediaController>()
-    private var lastTrackKey = ""
+    private var lastSentSignature = ""
+    private var updateJob: Job? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
@@ -42,7 +45,10 @@ class MediaListenerService : NotificationListenerService() {
 
     private val controllerCallback = object : MediaController.Callback() {
         override fun onMetadataChanged(metadata: MediaMetadata?) {
-            handleMetadataChange(metadata)
+            triggerMediaUpdate()
+        }
+        override fun onPlaybackStateChanged(state: PlaybackState?) {
+            triggerMediaUpdate()
         }
     }
 
@@ -57,6 +63,16 @@ class MediaListenerService : NotificationListenerService() {
             updateActiveSessions(initialControllers)
         } catch (e: SecurityException) {
             Log.e(TAG, "Notification access permission not granted", e)
+        }
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        super.onNotificationPosted(sbn)
+        if (sbn == null) return
+        val isMedia = sbn.notification.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)
+        val pkg = sbn.packageName.lowercase()
+        if (isMedia || pkg.contains("youtube") || pkg.contains("spotify") || pkg.contains("music")) {
+            triggerMediaUpdate()
         }
     }
 
@@ -75,8 +91,7 @@ class MediaListenerService : NotificationListenerService() {
             controller.registerCallback(controllerCallback)
         }
 
-        val currentController = activeControllers.firstOrNull()
-        handleMetadataChange(currentController?.metadata)
+        triggerMediaUpdate()
     }
 
     private fun unregisterControllers() {
@@ -86,37 +101,30 @@ class MediaListenerService : NotificationListenerService() {
         activeControllers.clear()
     }
 
-    private fun handleMetadataChange(metadata: MediaMetadata?) {
-        if (metadata == null) return
+    private fun getPlayingController(): MediaController? {
+        return activeControllers.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+            ?: activeControllers.firstOrNull()
+    }
 
-        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Unknown Title"
-        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "Unknown Artist"
-        val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
+    private fun triggerMediaUpdate() {
+        updateJob?.cancel()
+        updateJob = serviceScope.launch {
+            delay(200)
 
-        val trackKey = "$title|$artist"
-        if (trackKey == lastTrackKey) {
-            return
-        }
-        lastTrackKey = trackKey
+            val controller = getPlayingController() ?: return@launch
+            val metadata = controller.metadata ?: return@launch
 
-        serviceScope.launch {
-            // ★重要: 通知のサムネイル画像が新曲に置き換わるまで少し待機 (前曲画像の誤取得を防止)
-            delay(350)
+            val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: return@launch
+            val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
+            val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
 
-            // 1. メタデータから直接Bitmap
             var bitmap: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
                 ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
 
-            // 2. 通知から取得 (曲名が一致する通知を最大3回リトライして確実に新曲画像を取得)
             if (bitmap == null) {
-                for (retry in 0..2) {
-                    bitmap = getArtworkFromNotification(title)
-                    if (bitmap != null) break
-                    delay(150)
-                }
+                bitmap = getArtworkFromActiveMediaNotification()
             }
 
-            // 3. Web URLからダウンロード
             if (bitmap == null) {
                 val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
                     ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
@@ -125,9 +133,22 @@ class MediaListenerService : NotificationListenerService() {
                 }
             }
 
+            if (bitmap == null) {
+                delay(200)
+                bitmap = getArtworkFromActiveMediaNotification()
+            }
+
             val finalBitmap = bitmap ?: createPlaceholderBitmap(240, 240)
             val processedBitmap = processBitmapTo240x240(finalBitmap)
-            val jpegBytes = compressToJpeg(processedBitmap, quality = 72)
+            
+            // ★色・データ圧縮: 品質45% (約5〜8KBに極小化！)
+            val jpegBytes = compressToJpeg(processedBitmap, quality = 45)
+
+            val signature = "$title|$artist|${jpegBytes.size}"
+            if (signature == lastSentSignature) {
+                return@launch
+            }
+            lastSentSignature = signature
 
             withContext(Dispatchers.Main) {
                 MediaStateHolder.updateTrack(title, artist, album, processedBitmap, jpegBytes)
@@ -136,30 +157,25 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
-    /**
-     * 曲名が合致する通知から画像(LargeIcon)を取得
-     */
-    private fun getArtworkFromNotification(targetTitle: String): Bitmap? {
+    private fun getArtworkFromActiveMediaNotification(): Bitmap? {
         return try {
             val notifications = activeNotifications ?: return null
             for (sbn in notifications) {
-                val extras = sbn.notification.extras
-                val notifTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
-                
-                // タイトルが一致または含まれる通知を優先
-                if (targetTitle.isNotEmpty() && (notifTitle.contains(targetTitle) || targetTitle.contains(notifTitle))) {
-                    val icon = sbn.notification.getLargeIcon()
+                val notif = sbn.notification
+                if (notif.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) {
+                    val icon = notif.getLargeIcon()
                     if (icon != null) {
                         return icon.loadDrawable(this)?.toBitmap()
                     }
                 }
             }
-            
-            // 見つからなければアクティブな先頭の通知から取得
             for (sbn in notifications) {
-                val icon = sbn.notification.getLargeIcon()
-                if (icon != null) {
-                    return icon.loadDrawable(this)?.toBitmap()
+                val pkg = sbn.packageName.lowercase()
+                if (pkg.contains("youtube") || pkg.contains("spotify") || pkg.contains("music")) {
+                    val icon = sbn.notification.getLargeIcon()
+                    if (icon != null) {
+                        return icon.loadDrawable(this)?.toBitmap()
+                    }
                 }
             }
             null
@@ -198,7 +214,7 @@ class MediaListenerService : NotificationListenerService() {
         return Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
     }
 
-    private fun compressToJpeg(bitmap: Bitmap, quality: Int = 72): ByteArray {
+    private fun compressToJpeg(bitmap: Bitmap, quality: Int = 45): ByteArray {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
         return stream.toByteArray()
