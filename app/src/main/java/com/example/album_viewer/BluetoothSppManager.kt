@@ -93,11 +93,13 @@ object BluetoothSppManager {
                     val jsonBytes = gson.toJson(metadataMap).toByteArray(Charsets.UTF_8)
                     sendRaw(buildPacket(0x01.toByte(), jsonBytes))
 
-                    delay(60)
+                    delay(100)
 
+                    // ★超重要: 256バイト小分け ＋ 15ms待機 (バッファあふれを物理的に完全防止)
                     if (jpegBytes != null && jpegBytes.isNotEmpty()) {
-                        sendRaw(buildPacket(0x02.toByte(), jpegBytes))
-                        Log.d(TAG, "Sent Media: $title (${jpegBytes.size} bytes)")
+                        val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
+                        sendChunkedSafe(imgPacket)
+                        Log.d(TAG, "Safe JPEG Sent: $title (${jpegBytes.size} bytes)")
                     }
                 } catch (e: Exception) {
                     _connectionStatus.value = ConnectionStatus.ERROR
@@ -107,9 +109,6 @@ object BluetoothSppManager {
         }
     }
 
-    /**
-     * 時・分・秒をESP32へ同期送信 (Type: 0x03)
-     */
     fun sendTimeSyncPacket(hour: Int, minute: Int, second: Int) {
         scope.launch {
             if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
@@ -130,6 +129,21 @@ object BluetoothSppManager {
         val out = outputStream ?: throw IOException("Output stream is null")
         out.write(packet)
         out.flush()
+    }
+
+    /**
+     * ★256バイトずつ送り、15ms待機してESP32の受信を完全同期
+     */
+    private suspend fun sendChunkedSafe(packet: ByteArray, chunkSize: Int = 256) = withContext(Dispatchers.IO) {
+        val out = outputStream ?: throw IOException("Output stream is null")
+        var offset = 0
+        while (offset < packet.size) {
+            val len = minOf(chunkSize, packet.size - offset)
+            out.write(packet, offset, len)
+            out.flush()
+            offset += len
+            delay(15) // ★15ms待機
+        }
     }
 
     private fun buildPacket(type: Byte, payload: ByteArray): ByteArray {

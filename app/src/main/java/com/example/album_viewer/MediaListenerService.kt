@@ -76,9 +76,9 @@ class MediaListenerService : NotificationListenerService() {
                             lastSentImageHash = bmpHash
 
                             val finalBmp = bitmap ?: createPlaceholderBitmap(240, 240)
-                            val processed = processBitmapToSquare(finalBmp, 240)
-                            // ★高画質化: 品質70% (ブロックノイズなしのクリア画質！)
-                            val jpegBytes = compressToJpeg(processed, quality = 70)
+                            val cleanBmp = processBitmapToStandardSquare(finalBmp, 240)
+                            // ★品質55% (約6〜8KBに軽量化し、ESP32のバッファに余裕で収める！)
+                            val jpegBytes = compressToStandardJpeg(cleanBmp, quality = 55)
 
                             val displayBmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
                             withContext(Dispatchers.Main) {
@@ -86,7 +86,7 @@ class MediaListenerService : NotificationListenerService() {
                             }
 
                             BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, "", jpegBytes)
-                            Log.d(TAG, "Sent Ultra-HD Track: ${trackInfo.title} (${jpegBytes.size} bytes)")
+                            Log.d(TAG, "Sent Track: ${trackInfo.title} (${jpegBytes.size} bytes)")
                         }
                     } else {
                         if (isPlayingMusic) {
@@ -113,7 +113,7 @@ class MediaListenerService : NotificationListenerService() {
     data class TrackInfo(val title: String, val artist: String, val bitmap: Bitmap?)
 
     private fun detectCurrentActiveTrack(): TrackInfo? {
-        // ★重要: オリジナルの高解像度画像を最優先で抽出
+        // 1. オリジナル高解像度Bitmapを最優先
         try {
             val component = ComponentName(this, MediaListenerService::class.java)
             val controllers = sessionManager?.getActiveSessions(component) ?: emptyList()
@@ -145,7 +145,7 @@ class MediaListenerService : NotificationListenerService() {
             // ignore
         }
 
-        // 通知から検出 (セッションがない場合のフォールバック)
+        // 2. 通知から検出
         val notifications = activeNotifications ?: return null
         for (sbn in notifications) {
             val notif = sbn.notification ?: continue
@@ -202,16 +202,21 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
-    private fun processBitmapToSquare(source: Bitmap, targetSize: Int = 240): Bitmap {
+    private fun processBitmapToStandardSquare(source: Bitmap, targetSize: Int = 240): Bitmap {
         val minEdge = minOf(source.width, source.height)
         val cropX = (source.width - minEdge) / 2
         val cropY = (source.height - minEdge) / 2
-
         val cropped = Bitmap.createBitmap(source, cropX, cropY, minEdge, minEdge)
-        return Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
+        val scaled = Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
+
+        val cleanBmp = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
+        val canvas = Canvas(cleanBmp)
+        canvas.drawColor(Color.BLACK)
+        canvas.drawBitmap(scaled, 0f, 0f, null)
+        return cleanBmp
     }
 
-    private fun compressToJpeg(bitmap: Bitmap, quality: Int = 70): ByteArray {
+    private fun compressToStandardJpeg(bitmap: Bitmap, quality: Int = 55): ByteArray {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
         return stream.toByteArray()
