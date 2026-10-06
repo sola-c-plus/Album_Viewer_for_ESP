@@ -11,7 +11,6 @@ import android.graphics.Paint
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
-import android.media.session.PlaybackState
 import android.net.Uri
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -21,6 +20,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -34,154 +34,95 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     private var sessionManager: MediaSessionManager? = null
-    private val activeControllers = mutableListOf<MediaController>()
-    private var lastSentSignature = ""
-    private var updateJob: Job? = null
+    private var pollingJob: Job? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
 
-    private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
-        updateActiveSessions(controllers)
-    }
-
-    private val controllerCallback = object : MediaController.Callback() {
-        override fun onMetadataChanged(metadata: MediaMetadata?) {
-            triggerMediaUpdate()
-        }
-        override fun onPlaybackStateChanged(state: PlaybackState?) {
-            triggerMediaUpdate()
-        }
-    }
+    private var lastSentTitle = ""
+    private var lastSentArtist = ""
 
     override fun onListenerConnected() {
         super.onListenerConnected()
         sessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
-        val componentName = ComponentName(this, MediaListenerService::class.java)
-
-        try {
-            sessionManager?.addOnActiveSessionsChangedListener(sessionListener, componentName)
-            val initialControllers = sessionManager?.getActiveSessions(componentName)
-            updateActiveSessions(initialControllers)
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Notification access permission not granted", e)
-        }
-    }
-
-    override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        super.onNotificationPosted(sbn)
-        if (sbn == null) return
-        val isMedia = sbn.notification.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)
-        val pkg = sbn.packageName.lowercase()
-        if (isMedia || pkg.contains("youtube") || pkg.contains("spotify") || pkg.contains("music")) {
-            triggerMediaUpdate()
-        }
+        startMonitoring()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        sessionManager?.removeOnActiveSessionsChangedListener(sessionListener)
-        unregisterControllers()
+        pollingJob?.cancel()
     }
 
-    private fun updateActiveSessions(controllers: List<MediaController>?) {
-        unregisterControllers()
-        if (controllers.isNullOrEmpty()) return
+    private fun startMonitoring() {
+        pollingJob?.cancel()
+        pollingJob = serviceScope.launch {
+            while (isActive) {
+                delay(400) // 400msごとに定期チェック
 
-        activeControllers.addAll(controllers)
-        for (controller in activeControllers) {
-            controller.registerCallback(controllerCallback)
-        }
+                try {
+                    val component = ComponentName(this@MediaListenerService, MediaListenerService::class.java)
+                    val controllers = sessionManager?.getActiveSessions(component) ?: emptyList()
+                    val controller = controllers.firstOrNull() ?: continue
+                    val metadata = controller.metadata ?: continue
 
-        triggerMediaUpdate()
-    }
+                    val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: continue
+                    val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
+                    val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
 
-    private fun unregisterControllers() {
-        for (controller in activeControllers) {
-            controller.unregisterCallback(controllerCallback)
-        }
-        activeControllers.clear()
-    }
+                    // 曲が変わった時だけ処理
+                    if (title != lastSentTitle || artist != lastSentArtist) {
+                        Log.d(TAG, "Track changed: $title")
+                        
+                        // プレイヤーの画像読み込み完了を0.4秒待機 (ズレ防止)
+                        delay(400)
 
-    private fun getPlayingController(): MediaController? {
-        return activeControllers.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
-            ?: activeControllers.firstOrNull()
-    }
+                        var bitmap: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                            ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                            ?: getActiveNotificationArtwork()
 
-    private fun triggerMediaUpdate() {
-        updateJob?.cancel()
-        updateJob = serviceScope.launch {
-            delay(200)
+                        if (bitmap == null) {
+                            val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+                                ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
+                            if (!uriStr.isNullOrEmpty()) {
+                                bitmap = fetchBitmapFromUri(uriStr)
+                            }
+                        }
 
-            val controller = getPlayingController() ?: return@launch
-            val metadata = controller.metadata ?: return@launch
+                        val finalBitmap = bitmap ?: createPlaceholderBitmap(240, 240)
+                        // ★240x240等倍フルサイズで送信 (ズレを完全解消)
+                        val processed = processBitmapToSquare(finalBitmap, 240)
+                        val jpegBytes = compressToJpeg(processed, quality = 65)
 
-            val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: return@launch
-            val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
-            val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
+                        lastSentTitle = title
+                        lastSentArtist = artist
 
-            var bitmap: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-                ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                        val displayBmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                        withContext(Dispatchers.Main) {
+                            MediaStateHolder.updateTrack(title, artist, album, displayBmp, jpegBytes)
+                        }
 
-            if (bitmap == null) {
-                bitmap = getArtworkFromActiveMediaNotification()
-            }
-
-            if (bitmap == null) {
-                val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
-                    ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
-                if (!uriStr.isNullOrEmpty()) {
-                    bitmap = fetchBitmapFromUri(uriStr)
-                }
-            }
-
-            if (bitmap == null) {
-                delay(200)
-                bitmap = getArtworkFromActiveMediaNotification()
-            }
-
-            val finalBitmap = bitmap ?: createPlaceholderBitmap(240, 240)
-            val processedBitmap = processBitmapTo240x240(finalBitmap)
-            
-            // ★色・データ圧縮: 品質45% (約5〜8KBに極小化！)
-            val jpegBytes = compressToJpeg(processedBitmap, quality = 45)
-
-            val signature = "$title|$artist|${jpegBytes.size}"
-            if (signature == lastSentSignature) {
-                return@launch
-            }
-            lastSentSignature = signature
-
-            withContext(Dispatchers.Main) {
-                MediaStateHolder.updateTrack(title, artist, album, processedBitmap, jpegBytes)
-            }
-            BluetoothSppManager.sendMediaPacket(title, artist, album, jpegBytes)
-        }
-    }
-
-    private fun getArtworkFromActiveMediaNotification(): Bitmap? {
-        return try {
-            val notifications = activeNotifications ?: return null
-            for (sbn in notifications) {
-                val notif = sbn.notification
-                if (notif.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) {
-                    val icon = notif.getLargeIcon()
-                    if (icon != null) {
-                        return icon.loadDrawable(this)?.toBitmap()
+                        BluetoothSppManager.sendMediaPacket(title, artist, album, jpegBytes)
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Monitor Error", e)
                 }
             }
-            for (sbn in notifications) {
-                val pkg = sbn.packageName.lowercase()
-                if (pkg.contains("youtube") || pkg.contains("spotify") || pkg.contains("music")) {
-                    val icon = sbn.notification.getLargeIcon()
-                    if (icon != null) {
-                        return icon.loadDrawable(this)?.toBitmap()
-                    }
-                }
-            }
-            null
-        } catch (e: Exception) {
-            null
         }
+    }
+
+    private fun getActiveNotificationArtwork(): Bitmap? {
+        val notifications = activeNotifications ?: return null
+        for (sbn in notifications) {
+            val notif = sbn.notification
+            if (notif.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) {
+                return notif.getLargeIcon()?.loadDrawable(this)?.toBitmap()
+            }
+        }
+        for (sbn in notifications) {
+            val pkg = sbn.packageName.lowercase()
+            if (pkg.contains("youtube") || pkg.contains("spotify") || pkg.contains("music")) {
+                return sbn.notification.getLargeIcon()?.loadDrawable(this)?.toBitmap()
+            }
+        }
+        return null
     }
 
     private suspend fun fetchBitmapFromUri(uriStr: String): Bitmap? = withContext(Dispatchers.IO) {
@@ -189,8 +130,8 @@ class MediaListenerService : NotificationListenerService() {
             if (uriStr.startsWith("http://") || uriStr.startsWith("https://")) {
                 val url = URL(uriStr)
                 val conn = url.openConnection() as HttpURLConnection
-                conn.connectTimeout = 5000
-                conn.readTimeout = 5000
+                conn.connectTimeout = 3000
+                conn.readTimeout = 3000
                 conn.doInput = true
                 conn.connect()
                 conn.inputStream.use { BitmapFactory.decodeStream(it) }
@@ -205,7 +146,7 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
-    private fun processBitmapTo240x240(source: Bitmap, targetSize: Int = 240): Bitmap {
+    private fun processBitmapToSquare(source: Bitmap, targetSize: Int = 240): Bitmap {
         val minEdge = minOf(source.width, source.height)
         val cropX = (source.width - minEdge) / 2
         val cropY = (source.height - minEdge) / 2
@@ -214,7 +155,7 @@ class MediaListenerService : NotificationListenerService() {
         return Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
     }
 
-    private fun compressToJpeg(bitmap: Bitmap, quality: Int = 45): ByteArray {
+    private fun compressToJpeg(bitmap: Bitmap, quality: Int = 65): ByteArray {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
         return stream.toByteArray()
@@ -224,13 +165,6 @@ class MediaListenerService : NotificationListenerService() {
         val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
         val canvas = Canvas(bmp)
         canvas.drawColor(Color.DKGRAY)
-        val paint = Paint().apply {
-            color = Color.LTGRAY
-            textSize = 28f
-            textAlign = Paint.Align.CENTER
-            isAntiAlias = true
-        }
-        canvas.drawText("No Artwork", width / 2f, height / 2f + 10f, paint)
         return bmp
     }
 }
