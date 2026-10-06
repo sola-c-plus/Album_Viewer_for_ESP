@@ -34,11 +34,12 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     private var sessionManager: MediaSessionManager? = null
-    private var pollingJob: Job? = null
+    private var monitorJob: Job? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
 
-    private var lastSentTitle = ""
-    private var lastSentArtist = ""
+    private var currentTitle = ""
+    private var currentArtist = ""
+    private var currentImageHash = 0
 
     override fun onListenerConnected() {
         super.onListenerConnected()
@@ -48,14 +49,17 @@ class MediaListenerService : NotificationListenerService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        pollingJob?.cancel()
+        monitorJob?.cancel()
     }
 
+    /**
+     * 250ms周期で監視し、画像が遅れて届いても自動で追従送信するシステム
+     */
     private fun startMonitoring() {
-        pollingJob?.cancel()
-        pollingJob = serviceScope.launch {
+        monitorJob?.cancel()
+        monitorJob = serviceScope.launch {
             while (isActive) {
-                delay(400) // 400msごとに定期チェック
+                delay(250)
 
                 try {
                     val component = ComponentName(this@MediaListenerService, MediaListenerService::class.java)
@@ -67,59 +71,73 @@ class MediaListenerService : NotificationListenerService() {
                     val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
                     val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
 
-                    // 曲が変わった時だけ処理
-                    if (title != lastSentTitle || artist != lastSentArtist) {
-                        Log.d(TAG, "Track changed: $title")
-                        
-                        // プレイヤーの画像読み込み完了を0.4秒待機 (ズレ防止)
-                        delay(400)
+                    val isNewTrack = (title != currentTitle || artist != currentArtist)
 
-                        var bitmap: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-                            ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
-                            ?: getActiveNotificationArtwork()
+                    // 1. 画像を取得
+                    var bitmap: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                        ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                        ?: getActiveNotificationArtwork(title)
 
-                        if (bitmap == null) {
-                            val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
-                                ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
-                            if (!uriStr.isNullOrEmpty()) {
-                                bitmap = fetchBitmapFromUri(uriStr)
-                            }
+                    if (bitmap == null) {
+                        val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+                            ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
+                        if (!uriStr.isNullOrEmpty()) {
+                            bitmap = fetchBitmapFromUri(uriStr)
                         }
+                    }
+
+                    // 画像の簡易ハッシュ (画像が変わったかどうかを検知)
+                    val bmpHash = bitmap?.generationId ?: 0
+
+                    // 曲が変わった場合、または同じ曲の画像が遅れてロード完了した場合に送信
+                    if (isNewTrack || (bmpHash != 0 && bmpHash != currentImageHash)) {
+                        currentTitle = title
+                        currentArtist = artist
+                        currentImageHash = bmpHash
 
                         val finalBitmap = bitmap ?: createPlaceholderBitmap(240, 240)
-                        // ★240x240等倍フルサイズで送信 (ズレを完全解消)
                         val processed = processBitmapToSquare(finalBitmap, 240)
                         val jpegBytes = compressToJpeg(processed, quality = 65)
-
-                        lastSentTitle = title
-                        lastSentArtist = artist
 
                         val displayBmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
                         withContext(Dispatchers.Main) {
                             MediaStateHolder.updateTrack(title, artist, album, displayBmp, jpegBytes)
                         }
 
+                        // ESP32へ安全送信
                         BluetoothSppManager.sendMediaPacket(title, artist, album, jpegBytes)
+                        Log.d(TAG, "Dispatched Track: $title (Hash: $bmpHash)")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Monitor Error", e)
+                    // エラー時はスキップして次回チェック
                 }
             }
         }
     }
 
-    private fun getActiveNotificationArtwork(): Bitmap? {
+    private fun getActiveNotificationArtwork(expectedTitle: String): Bitmap? {
         val notifications = activeNotifications ?: return null
+        // 1. タイトルが一致する通知から取得
+        for (sbn in notifications) {
+            val notif = sbn.notification
+            val extras = notif.extras
+            val notifTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+
+            if (notifTitle.isNotEmpty() && (notifTitle.contains(expectedTitle, ignoreCase = true) || expectedTitle.contains(notifTitle, ignoreCase = true))) {
+                val icon = notif.getLargeIcon()
+                if (icon != null) {
+                    return icon.loadDrawable(this)?.toBitmap()
+                }
+            }
+        }
+        // 2. メディア通知から取得
         for (sbn in notifications) {
             val notif = sbn.notification
             if (notif.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) {
-                return notif.getLargeIcon()?.loadDrawable(this)?.toBitmap()
-            }
-        }
-        for (sbn in notifications) {
-            val pkg = sbn.packageName.lowercase()
-            if (pkg.contains("youtube") || pkg.contains("spotify") || pkg.contains("music")) {
-                return sbn.notification.getLargeIcon()?.loadDrawable(this)?.toBitmap()
+                val icon = notif.getLargeIcon()
+                if (icon != null) {
+                    return icon.loadDrawable(this)?.toBitmap()
+                }
             }
         }
         return null

@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.io.OutputStream
@@ -42,6 +44,9 @@ object BluetoothSppManager {
     private var outputStream: OutputStream? = null
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private val gson = Gson()
+    
+    // ★重要: パケット混ざり・読み飛ばしを防ぐ排他ロック
+    private val sendMutex = Mutex()
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
@@ -80,53 +85,49 @@ object BluetoothSppManager {
         }
     }
 
+    /**
+     * 排他制御で絶対に1つの曲送信が完了するまで次のパケットを割り込ませない
+     */
     fun sendMediaPacket(title: String, artist: String, album: String, jpegBytes: ByteArray?) {
         scope.launch {
             if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) {
                 return@launch
             }
 
-            try {
-                // 1. JSON メタデータ送信
-                val metadataMap = mapOf(
-                    "title" to title,
-                    "artist" to artist,
-                    "album" to album
-                )
-                val jsonStr = gson.toJson(metadataMap)
-                val jsonBytes = jsonStr.toByteArray(Charsets.UTF_8)
-                val metaPacket = buildPacket(0x01.toByte(), jsonBytes)
-                sendChunked(metaPacket)
+            sendMutex.withLock {
+                try {
+                    // 1. JSON メタデータ送信
+                    val metadataMap = mapOf(
+                        "title" to title,
+                        "artist" to artist,
+                        "album" to album
+                    )
+                    val jsonStr = gson.toJson(metadataMap)
+                    val jsonBytes = jsonStr.toByteArray(Charsets.UTF_8)
+                    val metaPacket = buildPacket(0x01.toByte(), jsonBytes)
+                    sendRaw(metaPacket)
 
-                delay(80)
+                    delay(60)
 
-                // 2. JPEG 画像送信 (512B チャンク送信)
-                if (jpegBytes != null && jpegBytes.isNotEmpty()) {
-                    val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
-                    sendChunked(imgPacket)
-                    Log.d(TAG, "JPEG Sent completely (${jpegBytes.size} bytes)")
+                    // 2. JPEG 画像送信
+                    if (jpegBytes != null && jpegBytes.isNotEmpty()) {
+                        val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
+                        sendRaw(imgPacket)
+                        Log.d(TAG, "Sent Complete: $title (${jpegBytes.size} bytes)")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to send packet", e)
+                    _connectionStatus.value = ConnectionStatus.ERROR
+                    disconnect()
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to send packet", e)
-                _connectionStatus.value = ConnectionStatus.ERROR
-                disconnect()
             }
         }
     }
 
-    /**
-     * 512バイトずつ小分けにして安全にストリーム送信する
-     */
-    private suspend fun sendChunked(packet: ByteArray, chunkSize: Int = 512) = withContext(Dispatchers.IO) {
+    private suspend fun sendRaw(packet: ByteArray) = withContext(Dispatchers.IO) {
         val out = outputStream ?: throw IOException("Output stream is null")
-        var offset = 0
-        while (offset < packet.size) {
-            val len = minOf(chunkSize, packet.size - offset)
-            out.write(packet, offset, len)
-            out.flush()
-            offset += len
-            delay(3) // ESP32の処理猶予（バッファあふれ防止）
-        }
+        out.write(packet)
+        out.flush()
     }
 
     private fun buildPacket(type: Byte, payload: ByteArray): ByteArray {
