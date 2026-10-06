@@ -44,8 +44,6 @@ object BluetoothSppManager {
     private var outputStream: OutputStream? = null
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private val gson = Gson()
-    
-    // ★重要: パケット混ざり・読み飛ばしを防ぐ排他ロック
     private val sendMutex = Mutex()
 
     @SuppressLint("MissingPermission")
@@ -76,7 +74,7 @@ object BluetoothSppManager {
             outputStream?.close()
             socket?.close()
         } catch (e: Exception) {
-            Log.e(TAG, "Error closing socket", e)
+            // ignore
         } finally {
             socket = null
             outputStream = null
@@ -85,40 +83,44 @@ object BluetoothSppManager {
         }
     }
 
-    /**
-     * 排他制御で絶対に1つの曲送信が完了するまで次のパケットを割り込ませない
-     */
     fun sendMediaPacket(title: String, artist: String, album: String, jpegBytes: ByteArray?) {
         scope.launch {
-            if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) {
-                return@launch
-            }
+            if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
 
             sendMutex.withLock {
                 try {
-                    // 1. JSON メタデータ送信
-                    val metadataMap = mapOf(
-                        "title" to title,
-                        "artist" to artist,
-                        "album" to album
-                    )
-                    val jsonStr = gson.toJson(metadataMap)
-                    val jsonBytes = jsonStr.toByteArray(Charsets.UTF_8)
-                    val metaPacket = buildPacket(0x01.toByte(), jsonBytes)
-                    sendRaw(metaPacket)
+                    val metadataMap = mapOf("title" to title, "artist" to artist, "album" to album)
+                    val jsonBytes = gson.toJson(metadataMap).toByteArray(Charsets.UTF_8)
+                    sendRaw(buildPacket(0x01.toByte(), jsonBytes))
 
                     delay(60)
 
-                    // 2. JPEG 画像送信
                     if (jpegBytes != null && jpegBytes.isNotEmpty()) {
-                        val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
-                        sendRaw(imgPacket)
-                        Log.d(TAG, "Sent Complete: $title (${jpegBytes.size} bytes)")
+                        sendRaw(buildPacket(0x02.toByte(), jpegBytes))
+                        Log.d(TAG, "Sent Media: $title (${jpegBytes.size} bytes)")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to send packet", e)
                     _connectionStatus.value = ConnectionStatus.ERROR
                     disconnect()
+                }
+            }
+        }
+    }
+
+    /**
+     * 時・分・秒をESP32へ同期送信 (Type: 0x03)
+     */
+    fun sendTimeSyncPacket(hour: Int, minute: Int, second: Int) {
+        scope.launch {
+            if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
+
+            sendMutex.withLock {
+                try {
+                    val timeMap = mapOf("h" to hour, "m" to minute, "s" to second)
+                    val jsonBytes = gson.toJson(timeMap).toByteArray(Charsets.UTF_8)
+                    sendRaw(buildPacket(0x03.toByte(), jsonBytes))
+                } catch (e: Exception) {
+                    // ignore
                 }
             }
         }
