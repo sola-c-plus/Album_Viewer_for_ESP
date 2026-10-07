@@ -1,4 +1,4 @@
-﻿package com.example.album_viewer
+package com.example.album_viewer
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
@@ -84,16 +84,30 @@ object BluetoothSppManager {
 
             sendMutex.withLock {
                 try {
+                    val out = outputStream ?: return@withLock
+
+                    // 1. メタデータ送信
                     val metadataMap = mapOf("title" to title, "artist" to artist, "album" to album)
                     val jsonBytes = gson.toJson(metadataMap).toByteArray(Charsets.UTF_8)
-                    sendRaw(buildPacket(0x01.toByte(), jsonBytes))
+                    val metaPacket = buildPacket(0x01.toByte(), jsonBytes)
+                    out.write(metaPacket)
+                    out.flush()
 
-                    delay(80)
+                    delay(60) // メタデータ処理待機
 
+                    // 2. JPEG画像送信 (128バイト分割 + 8ms待機でESP32バッファ溢れを完全防止)
                     if (jpegBytes != null && jpegBytes.isNotEmpty()) {
                         val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
-                        sendChunkedSafe(imgPacket, chunkSize = 256)
-                        Log.d(TAG, "Safe JPEG Sent: $title (${jpegBytes.size} bytes)")
+                        var offset = 0
+                        val chunkSize = 128
+                        while (offset < imgPacket.size) {
+                            val len = minOf(chunkSize, imgPacket.size - offset)
+                            out.write(imgPacket, offset, len)
+                            out.flush()
+                            offset += len
+                            delay(8)
+                        }
+                        Log.d(TAG, "Safe Stream JPEG Sent: $title (${jpegBytes.size} bytes)")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to send media packet", e)
@@ -108,33 +122,20 @@ object BluetoothSppManager {
         scope.launch {
             if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
 
-            sendMutex.withLock {
-                try {
-                    val timeMap = mapOf("h" to hour, "m" to minute, "s" to second)
-                    val jsonBytes = gson.toJson(timeMap).toByteArray(Charsets.UTF_8)
-                    sendRaw(buildPacket(0x03.toByte(), jsonBytes))
-                } catch (e: Exception) {
-                    // ignore
-                }
+            if (!sendMutex.tryLock()) return@launch
+
+            try {
+                val timeMap = mapOf("h" to hour, "m" to minute, "s" to second)
+                val jsonBytes = gson.toJson(timeMap).toByteArray(Charsets.UTF_8)
+                val timePacket = buildPacket(0x03.toByte(), jsonBytes)
+                val out = outputStream ?: return@launch
+                out.write(timePacket)
+                out.flush()
+            } catch (e: Exception) {
+                // ignore
+            } finally {
+                sendMutex.unlock()
             }
-        }
-    }
-
-    private suspend fun sendRaw(packet: ByteArray) = withContext(Dispatchers.IO) {
-        val out = outputStream ?: throw IOException("Output stream is null")
-        out.write(packet)
-        out.flush()
-    }
-
-    private suspend fun sendChunkedSafe(packet: ByteArray, chunkSize: Int = 256) = withContext(Dispatchers.IO) {
-        val out = outputStream ?: throw IOException("Output stream is null")
-        var offset = 0
-        while (offset < packet.size) {
-            val len = minOf(chunkSize, packet.size - offset)
-            out.write(packet, offset, len)
-            out.flush()
-            offset += len
-            delay(12) // ESP32の受信バッファ溢れを完全に防ぐ安定待機
         }
     }
 

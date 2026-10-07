@@ -1,4 +1,4 @@
-﻿package com.example.album_viewer
+package com.example.album_viewer
 
 import android.app.Notification
 import android.content.ComponentName
@@ -7,11 +7,13 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.media.MediaMetadata
-import android.media.session.MediaController
 import android.media.session.MediaSessionManager
-import android.media.session.PlaybackState
 import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Parcelable
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
@@ -21,6 +23,7 @@ import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Calendar
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MediaListenerService : NotificationListenerService() {
 
@@ -31,14 +34,14 @@ class MediaListenerService : NotificationListenerService() {
     private var sessionManager: MediaSessionManager? = null
     private var monitorJob: Job? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val isUpdating = AtomicBoolean(false)
 
     private var currentTitle = ""
     private var currentArtist = ""
-    private var lastSentImageHash = 0
     private var isPlayingMusic = false
 
-    private val sessionCallback = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
-        updateActiveMedia()
+    private val sessionCallback = MediaSessionManager.OnActiveSessionsChangedListener {
+        triggerUpdate()
     }
 
     override fun onListenerConnected() {
@@ -60,7 +63,7 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        updateActiveMedia()
+        triggerUpdate()
     }
 
     private fun startRealtimeMonitoring() {
@@ -73,94 +76,98 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
-    private fun updateActiveMedia() {
+    private fun triggerUpdate() {
         serviceScope.launch {
-            try {
-                val trackInfo = detectCurrentActiveTrack()
+            updateActiveMedia()
+        }
+    }
 
-                if (trackInfo != null && trackInfo.title.isNotEmpty()) {
-                    isPlayingMusic = true
-                    val isNewTrack = (trackInfo.title != currentTitle || trackInfo.artist != currentArtist)
-                    val bitmap = trackInfo.bitmap
-                    val bmpHash = bitmap?.hashCode() ?: 0
+    private suspend fun updateActiveMedia() {
+        if (!isUpdating.compareAndSet(false, true)) return
 
-                    if (isNewTrack || (bmpHash != 0 && bmpHash != lastSentImageHash)) {
-                        currentTitle = trackInfo.title
-                        currentArtist = trackInfo.artist
-                        lastSentImageHash = bmpHash
+        try {
+            val trackInfo = detectCurrentActiveTrack()
 
-                        val finalBmp = bitmap ?: createPlaceholderBitmap(240, 240)
-                        val cleanBmp = processBitmapToStandardSquare(finalBmp, 240)
-                        val jpegBytes = compressToStandardJpeg(cleanBmp, quality = 60)
+            if (trackInfo != null && trackInfo.title.isNotEmpty()) {
+                isPlayingMusic = true
+                // ★曲が変わった時だけ1回だけ送信する（無限ループ送信を完全防止）
+                val isNewTrack = (trackInfo.title != currentTitle || trackInfo.artist != currentArtist)
 
-                        val displayBmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-                        withContext(Dispatchers.Main) {
-                            MediaStateHolder.updateTrack(trackInfo.title, trackInfo.artist, "", displayBmp, jpegBytes)
-                        }
+                if (isNewTrack) {
+                    currentTitle = trackInfo.title
+                    currentArtist = trackInfo.artist
 
-                        BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, "", jpegBytes)
-                        Log.d(TAG, "Sent Track: ${trackInfo.title} (${jpegBytes.size} bytes)")
-                    }
-                } else {
-                    if (isPlayingMusic) {
-                        isPlayingMusic = false
-                        currentTitle = ""
-                        currentArtist = ""
-                        lastSentImageHash = 0
+                    val highResBmp = trackInfo.bitmap ?: createPlaceholderBitmap(240, 240)
+                    val squareBmp = processBitmapToStandardBaseline(highResBmp, 240)
+                    val jpegBytes = compressToBaselineJpeg(squareBmp, quality = 65)
+
+                    withContext(Dispatchers.Main) {
+                        MediaStateHolder.updateTrack(trackInfo.title, trackInfo.artist, "", squareBmp, jpegBytes)
                     }
 
-                    val cal = Calendar.getInstance()
-                    BluetoothSppManager.sendTimeSyncPacket(
-                        cal.get(Calendar.HOUR_OF_DAY),
-                        cal.get(Calendar.MINUTE),
-                        cal.get(Calendar.SECOND)
-                    )
+                    BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, "", jpegBytes)
+                    Log.d(TAG, "Sent New Track ONCE: ${trackInfo.title} (${jpegBytes.size} bytes)")
                 }
-            } catch (e: Exception) {
-                // ignore
+            } else {
+                if (isPlayingMusic) {
+                    isPlayingMusic = false
+                    currentTitle = ""
+                    currentArtist = ""
+                }
+
+                val cal = Calendar.getInstance()
+                BluetoothSppManager.sendTimeSyncPacket(
+                    cal.get(Calendar.HOUR_OF_DAY),
+                    cal.get(Calendar.MINUTE),
+                    cal.get(Calendar.SECOND)
+                )
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in updateActiveMedia", e)
+        } finally {
+            isUpdating.set(false)
         }
     }
 
     data class TrackInfo(val title: String, val artist: String, val bitmap: Bitmap?)
 
     private fun detectCurrentActiveTrack(): TrackInfo? {
-        // 1. MediaSession から優先的に取得
         try {
             val component = ComponentName(this, MediaListenerService::class.java)
             val controllers = sessionManager?.getActiveSessions(component) ?: emptyList()
             for (controller in controllers) {
-                val state = controller.playbackState?.state
-                if (state == PlaybackState.STATE_PLAYING || state == PlaybackState.STATE_BUFFERING) {
-                    val metadata = controller.metadata
-                    if (metadata != null) {
-                        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: ""
-                        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
-                        var bmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-                            ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                val metadata = controller.metadata ?: continue
+                val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: ""
+                val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
 
-                        if (bmp == null) {
-                            val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
-                                ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
-                            if (!uriStr.isNullOrEmpty()) {
-                                bmp = fetchBitmapFromUri(uriStr)
-                            }
-                        }
+                if (title.isNotEmpty()) {
+                    var bmp: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                        ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
 
-                        if (title.isNotEmpty()) {
-                            if (bmp == null) {
-                                bmp = getNotificationLargeIconFallback(title)
-                            }
-                            return TrackInfo(title, artist, bmp)
+                    if (bmp == null) {
+                        val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+                            ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
+                            ?: metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI)
+                        if (!uriStr.isNullOrEmpty()) {
+                            bmp = fetchBitmapFromUri(uriStr)
                         }
                     }
+
+                    if (bmp == null) {
+                        bmp = getNotificationHighResArt(title)
+                    }
+
+                    if (bmp == null) {
+                        bmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+                    }
+
+                    return TrackInfo(title, artist, bmp)
                 }
             }
         } catch (e: Exception) {
-            // ignore
+            Log.e(TAG, "MediaSession check error", e)
         }
 
-        // 2. 通知からのフォールバック検出
         val notifications = activeNotifications ?: return null
         for (sbn in notifications) {
             val notif = sbn.notification ?: continue
@@ -171,10 +178,9 @@ class MediaListenerService : NotificationListenerService() {
             if (isMedia || pkg.contains("spotify") || pkg.contains("youtube") || pkg.contains("music") || pkg.contains("audio")) {
                 val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
                 val artist = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
-                val icon = notif.getLargeIcon()
-                val bmp = icon?.loadDrawable(this)?.toBitmap()
 
                 if (title.isNotEmpty()) {
+                    val bmp = getHighResFromNotificationExtras(extras, notif)
                     return TrackInfo(title, artist, bmp)
                 }
             }
@@ -183,16 +189,36 @@ class MediaListenerService : NotificationListenerService() {
         return null
     }
 
-    private fun getNotificationLargeIconFallback(expectedTitle: String): Bitmap? {
+    private fun getNotificationHighResArt(expectedTitle: String): Bitmap? {
         val notifications = activeNotifications ?: return null
         for (sbn in notifications) {
             val notif = sbn.notification ?: continue
             val extras = notif.extras ?: continue
             val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
             if (title.contains(expectedTitle, ignoreCase = true) || expectedTitle.contains(title, ignoreCase = true)) {
-                return notif.getLargeIcon()?.loadDrawable(this)?.toBitmap()
+                return getHighResFromNotificationExtras(extras, notif)
             }
         }
+        return null
+    }
+
+    private fun getHighResFromNotificationExtras(extras: Bundle, notif: Notification): Bitmap? {
+        if (extras.containsKey(Notification.EXTRA_PICTURE)) {
+            val pic = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                extras.getParcelable(Notification.EXTRA_PICTURE, Bitmap::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                extras.getParcelable<Parcelable>(Notification.EXTRA_PICTURE) as? Bitmap
+            }
+            if (pic != null) return pic
+        }
+
+        val largeIcon = notif.getLargeIcon()
+        if (largeIcon != null) {
+            val bmp = largeIcon.loadDrawable(this)?.toBitmap()
+            if (bmp != null) return bmp
+        }
+
         return null
     }
 
@@ -203,9 +229,12 @@ class MediaListenerService : NotificationListenerService() {
                 val conn = url.openConnection() as HttpURLConnection
                 conn.connectTimeout = 3000
                 conn.readTimeout = 3000
+                conn.instanceFollowRedirects = true
                 conn.doInput = true
                 conn.connect()
-                conn.inputStream.use { BitmapFactory.decodeStream(it) }
+                conn.inputStream.use { inputStream ->
+                    BitmapFactory.decodeStream(inputStream)
+                }
             } else {
                 val uri = Uri.parse(uriStr)
                 contentResolver.openInputStream(uri)?.use { inputStream ->
@@ -217,21 +246,22 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
-    private fun processBitmapToStandardSquare(source: Bitmap, targetSize: Int = 240): Bitmap {
+    private fun processBitmapToStandardBaseline(source: Bitmap, targetSize: Int = 240): Bitmap {
         val minEdge = minOf(source.width, source.height)
         val cropX = (source.width - minEdge) / 2
         val cropY = (source.height - minEdge) / 2
         val cropped = Bitmap.createBitmap(source, cropX, cropY, minEdge, minEdge)
         val scaled = Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
 
-        val cleanBmp = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
-        val canvas = Canvas(cleanBmp)
+        val result = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
+        val canvas = Canvas(result)
         canvas.drawColor(Color.BLACK)
-        canvas.drawBitmap(scaled, 0f, 0f, null)
-        return cleanBmp
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        canvas.drawBitmap(scaled, 0f, 0f, paint)
+        return result
     }
 
-    private fun compressToStandardJpeg(bitmap: Bitmap, quality: Int = 60): ByteArray {
+    private fun compressToBaselineJpeg(bitmap: Bitmap, quality: Int = 65): ByteArray {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
         return stream.toByteArray()
