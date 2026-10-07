@@ -64,7 +64,7 @@ class MediaListenerService : NotificationListenerService() {
 
     private var lastRawArtwork: Bitmap? = null
 
-    // 停止後判定（3秒後にダッシュボード移行）
+    // 停止後1.5秒判定用
     private var stopDetectionTimestamp: Long = 0L
     private var isStandbyScreenActive = false
     private var lastSentMinute = -1
@@ -72,7 +72,7 @@ class MediaListenerService : NotificationListenerService() {
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         registerControllerCallbacks(controllers)
-        triggerUpdateWithDebounce(450)
+        triggerUpdateWithDebounce(300)
     }
 
     override fun onListenerConnected() {
@@ -88,11 +88,10 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "Failed to register active sessions listener", e)
         }
 
-        // Bluetooth再接続時に自動再同期
         serviceScope.launch {
             BluetoothSppManager.connectionStatus.collect { status ->
                 if (status == ConnectionStatus.CONNECTED) {
-                    Log.d(TAG, "Bluetooth Connected -> Auto Resyncing...")
+                    Log.d(TAG, "Bluetooth Connected -> Resyncing...")
                     delay(800)
                     isStandbyScreenActive = false
                     currentTitle = ""
@@ -126,11 +125,11 @@ class MediaListenerService : NotificationListenerService() {
             return
         }
 
-        triggerUpdateWithDebounce(450)
+        triggerUpdateWithDebounce(300)
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
-        triggerUpdateWithDebounce(450)
+        triggerUpdateWithDebounce(300)
     }
 
     private fun shouldShowNotificationPopup(sbn: StatusBarNotification): Boolean {
@@ -230,7 +229,7 @@ class MediaListenerService : NotificationListenerService() {
                 }
 
                 override fun onPlaybackStateChanged(state: PlaybackState?) {
-                    triggerUpdateWithDebounce(300)
+                    triggerUpdateWithDebounce(200)
                 }
             }
             try {
@@ -257,7 +256,7 @@ class MediaListenerService : NotificationListenerService() {
         monitorJob?.cancel()
         monitorJob = serviceScope.launch {
             while (isActive) {
-                delay(1000)
+                delay(800)
                 if (!isShowingNotificationPopup) {
                     updateActiveMedia()
                 }
@@ -290,10 +289,16 @@ class MediaListenerService : NotificationListenerService() {
         try {
             val trackInfo = detectCurrentActiveTrack()
             val isAudioActive = audioManager?.isMusicActive == true
-            val hasTrackInfo = (trackInfo != null && trackInfo.title.isNotBlank())
 
-            // ★曲情報が存在する場合は、再生・一時停止を問わず確実にアルバムアートを送信！
-            if (hasTrackInfo && trackInfo != null) {
+            // ★真の再生中判定：曲が存在し、かつ実際に再生中（PLAYING または 音が出ている）
+            val isMusicActuallyPlaying = trackInfo != null && 
+                                         trackInfo.title.isNotBlank() && 
+                                         (trackInfo.isPlaying || isAudioActive)
+
+            if (isMusicActuallyPlaying && trackInfo != null) {
+                // ==========================================
+                // 🎵 1. 音楽再生中（PLAYING）
+                // ==========================================
                 stopDetectionTimestamp = 0L
                 isStandbyScreenActive = false
 
@@ -319,7 +324,9 @@ class MediaListenerService : NotificationListenerService() {
                     Log.d(TAG, "Sent Track & Art: [${trackInfo.packageName}] ${trackInfo.title} (${jpegBytes.size} bytes)")
                 }
             } else {
-                // ⏸️ 曲情報が完全にない場合（3秒経過後にダッシュボードへ）
+                // ==========================================
+                // ⏸️ 2. 音楽停止中（一時停止 PAUSED または 完全停止）
+                // ==========================================
                 val now = System.currentTimeMillis()
                 val cal = Calendar.getInstance()
                 val currentMinute = cal.get(Calendar.MINUTE)
@@ -327,18 +334,20 @@ class MediaListenerService : NotificationListenerService() {
 
                 if (stopDetectionTimestamp == 0L) {
                     stopDetectionTimestamp = now
-                } else if (!isStandbyScreenActive && (now - stopDetectionTimestamp >= 3000L)) {
+                } else if (!isStandbyScreenActive && (now - stopDetectionTimestamp >= 1500L)) {
+                    // ★一時停止から1.5秒経過！時計（スマートダッシュボード）へ切り替え
                     isStandbyScreenActive = true
+                    lastSentTrackSignature = "" // 再生再開時に即座にアルバムアートを再送できるようにリセット
                     currentTitle = ""
                     currentArtist = ""
                     currentPackage = ""
-                    lastSentTrackSignature = ""
-                    lastRawArtwork = null
                     lastSentMinute = currentMinute
                     lastSentBatteryPct = batteryPct
 
                     sendStandbyDashboard(cal, batteryPct, isCharging)
+                    Log.d(TAG, "Music Stopped/Paused -> Switched to Standby Clock")
                 } else if (isStandbyScreenActive) {
+                    // 待機画面中：1分ごとに時計画像を更新（時計が止まらない）
                     if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5) {
                         lastSentMinute = currentMinute
                         lastSentBatteryPct = batteryPct
@@ -438,6 +447,7 @@ class MediaListenerService : NotificationListenerService() {
 
         if (candidates.isEmpty()) return null
 
+        // 再生中(isPlaying == true)を最優先でソート
         return candidates
             .sortedWith(compareByDescending<TrackInfo> { it.isPlaying }
                 .thenByDescending { it.lastUpdateTime })
