@@ -1,4 +1,4 @@
-package com.example.album_viewer
+﻿package com.example.album_viewer
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
@@ -6,17 +6,12 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import android.util.Log
 import com.google.gson.Gson
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.io.OutputStream
 import java.nio.ByteBuffer
@@ -42,7 +37,7 @@ object BluetoothSppManager {
 
     private var socket: BluetoothSocket? = null
     private var outputStream: OutputStream? = null
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
     private val sendMutex = Mutex()
 
@@ -93,15 +88,15 @@ object BluetoothSppManager {
                     val jsonBytes = gson.toJson(metadataMap).toByteArray(Charsets.UTF_8)
                     sendRaw(buildPacket(0x01.toByte(), jsonBytes))
 
-                    delay(100)
+                    delay(80)
 
-                    // ★超重要: 256バイト小分け ＋ 15ms待機 (バッファあふれを物理的に完全防止)
                     if (jpegBytes != null && jpegBytes.isNotEmpty()) {
                         val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
-                        sendChunkedSafe(imgPacket)
+                        sendChunkedSafe(imgPacket, chunkSize = 256)
                         Log.d(TAG, "Safe JPEG Sent: $title (${jpegBytes.size} bytes)")
                     }
                 } catch (e: Exception) {
+                    Log.e(TAG, "Failed to send media packet", e)
                     _connectionStatus.value = ConnectionStatus.ERROR
                     disconnect()
                 }
@@ -131,9 +126,6 @@ object BluetoothSppManager {
         out.flush()
     }
 
-    /**
-     * ★256バイトずつ送り、15ms待機してESP32の受信を完全同期
-     */
     private suspend fun sendChunkedSafe(packet: ByteArray, chunkSize: Int = 256) = withContext(Dispatchers.IO) {
         val out = outputStream ?: throw IOException("Output stream is null")
         var offset = 0
@@ -142,7 +134,7 @@ object BluetoothSppManager {
             out.write(packet, offset, len)
             out.flush()
             offset += len
-            delay(15) // ★15ms待機
+            delay(12) // ESP32の受信バッファ溢れを完全に防ぐ安定待機
         }
     }
 

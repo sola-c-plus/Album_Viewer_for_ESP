@@ -1,10 +1,9 @@
-package com.example.album_viewer
+﻿package com.example.album_viewer
 
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -119,7 +118,7 @@ fun MainScreen() {
     ) {
         Text(
             text = "ESP32 Music Display",
-            fontSize = 24.sp,
+            fontSize = 22.sp,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onBackground
         )
@@ -298,15 +297,6 @@ fun MainScreen() {
                     color = Color.LightGray,
                     textAlign = TextAlign.Center
                 )
-
-                if (currentTrack.album.isNotEmpty()) {
-                    Text(
-                        text = currentTrack.album,
-                        fontSize = 12.sp,
-                        color = Color.Gray,
-                        textAlign = TextAlign.Center
-                    )
-                }
 
                 Spacer(modifier = Modifier.height(12.dp))
 
