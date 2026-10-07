@@ -93,9 +93,10 @@ object BluetoothSppManager {
                     out.write(metaPacket)
                     out.flush()
 
-                    delay(60) // メタデータ処理待機
+                    // ESP32側のメタデータ処理完了を待つ (180ms)
+                    delay(180)
 
-                    // 2. JPEG画像送信 (128バイト分割 + 8ms待機でESP32バッファ溢れを完全防止)
+                    // 2. JPEG画像送信 (128バイト分割 + 12ms待機で確実転送)
                     if (jpegBytes != null && jpegBytes.isNotEmpty()) {
                         val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
                         var offset = 0
@@ -105,9 +106,9 @@ object BluetoothSppManager {
                             out.write(imgPacket, offset, len)
                             out.flush()
                             offset += len
-                            delay(8)
+                            delay(12)
                         }
-                        Log.d(TAG, "Safe Stream JPEG Sent: $title (${jpegBytes.size} bytes)")
+                        Log.d(TAG, "Safe JPEG Sent: $title (${jpegBytes.size} bytes)")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to send media packet", e)

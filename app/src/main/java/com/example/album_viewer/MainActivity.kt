@@ -1,4 +1,4 @@
-﻿package com.example.album_viewer
+package com.example.album_viewer
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -20,6 +20,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -249,7 +250,7 @@ fun MainScreen() {
             }
         }
 
-        Spacer(modifier = Modifier.height(20.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -260,14 +261,14 @@ fun MainScreen() {
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text("再生中プレビュー (240x240 円形)", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
                 Box(
                     modifier = Modifier
                         .size(180.dp)
                         .clip(CircleShape)
                         .background(Color.Black)
-                        .border(2.dp, Color(0xFF444444), CircleShape),
+                        .border(2.dp, Color(0xFF00D2FF), CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
                     if (currentTrack.bitmap != null) {
@@ -281,11 +282,11 @@ fun MainScreen() {
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
                 Text(
                     text = currentTrack.title.ifEmpty { "再生中の曲はありません" },
-                    fontSize = 18.sp,
+                    fontSize = 17.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface,
                     textAlign = TextAlign.Center
@@ -294,9 +295,36 @@ fun MainScreen() {
                 Text(
                     text = currentTrack.artist.ifEmpty { "-" },
                     fontSize = 14.sp,
-                    color = Color.LightGray,
+                    color = Color(0xFF00D2FF),
                     textAlign = TextAlign.Center
                 )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color(0xFF181A20),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text(
+                            text = "【取得診断】",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Gray
+                        )
+                        Text(
+                            text = "アプリ: ${currentTrack.packageName.ifEmpty { "未検出" }}",
+                            fontSize = 12.sp,
+                            color = Color.LightGray
+                        )
+                        Text(
+                            text = "画像: ${if (currentTrack.hasArtwork) "取得成功 (${currentTrack.jpegBytes?.size ?: 0} bytes)" else "画像なし (自動生成)"}",
+                            fontSize = 12.sp,
+                            color = if (currentTrack.hasArtwork) Color(0xFF4CAF50) else Color(0xFFFFC107)
+                        )
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -309,9 +337,10 @@ fun MainScreen() {
                             currentTrack.jpegBytes
                         )
                     },
-                    enabled = connectionStatus == ConnectionStatus.CONNECTED && currentTrack.title.isNotEmpty()
+                    enabled = connectionStatus == ConnectionStatus.CONNECTED && currentTrack.title.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("ESP32へ再送信")
+                    Text("ESP32へ手動再送信")
                 }
             }
         }

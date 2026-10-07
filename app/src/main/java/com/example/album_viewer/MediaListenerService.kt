@@ -3,26 +3,40 @@ package com.example.album_viewer
 import android.app.Notification
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.media.AudioManager
 import android.media.MediaMetadata
+import android.media.session.MediaController
 import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
+import android.util.LruCache
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MediaListenerService : NotificationListenerService() {
@@ -32,95 +46,305 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     private var sessionManager: MediaSessionManager? = null
+    private var audioManager: AudioManager? = null
     private var monitorJob: Job? = null
+    private var updateDebounceJob: Job? = null
+    private var popupDismissJob: Job? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val isUpdating = AtomicBoolean(false)
 
+    private val activeControllers = ConcurrentHashMap<MediaController, MediaController.Callback>()
+    private val handledNotificationKeys = LruCache<String, Long>(50)
+
     private var currentTitle = ""
     private var currentArtist = ""
-    private var isPlayingMusic = false
+    private var currentPackage = ""
+    private var lastSentTrackSignature = ""
+    private var isShowingNotificationPopup = false
 
-    private val sessionCallback = MediaSessionManager.OnActiveSessionsChangedListener {
-        triggerUpdate()
+    private var lastRawArtwork: Bitmap? = null
+
+    // 停止後判定（3秒後にダッシュボード移行）
+    private var stopDetectionTimestamp: Long = 0L
+    private var isStandbyScreenActive = false
+    private var lastSentMinute = -1
+    private var lastSentBatteryPct = -1
+
+    private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+        registerControllerCallbacks(controllers)
+        triggerUpdateWithDebounce(450)
     }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
         sessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val component = ComponentName(this, MediaListenerService::class.java)
         try {
-            sessionManager?.addOnActiveSessionsChangedListener(sessionCallback, component)
+            sessionManager?.addOnActiveSessionsChangedListener(sessionListener, component)
+            val initial = sessionManager?.getActiveSessions(component)
+            registerControllerCallbacks(initial)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register active sessions listener", e)
         }
-        startRealtimeMonitoring()
+
+        // Bluetooth再接続時に自動再同期
+        serviceScope.launch {
+            BluetoothSppManager.connectionStatus.collect { status ->
+                if (status == ConnectionStatus.CONNECTED) {
+                    Log.d(TAG, "Bluetooth Connected -> Auto Resyncing...")
+                    delay(800)
+                    isStandbyScreenActive = false
+                    currentTitle = ""
+                    currentArtist = ""
+                    currentPackage = ""
+                    lastSentTrackSignature = ""
+                    lastSentMinute = -1
+                    stopDetectionTimestamp = 0L
+                    triggerUpdateDirect()
+                }
+            }
+        }
+
+        startMonitoringLoop()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         monitorJob?.cancel()
-        sessionManager?.removeOnActiveSessionsChangedListener(sessionCallback)
+        updateDebounceJob?.cancel()
+        popupDismissJob?.cancel()
+        unregisterAllCallbacks()
+        sessionManager?.removeOnActiveSessionsChangedListener(sessionListener)
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        triggerUpdate()
+        if (sbn == null) return
+
+        if (shouldShowNotificationPopup(sbn)) {
+            handleNotificationPopup(sbn)
+            return
+        }
+
+        triggerUpdateWithDebounce(450)
     }
 
-    private fun startRealtimeMonitoring() {
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        triggerUpdateWithDebounce(450)
+    }
+
+    private fun shouldShowNotificationPopup(sbn: StatusBarNotification): Boolean {
+        if (sbn.packageName == packageName) return false
+        if (sbn.isOngoing) return false
+
+        val notif = sbn.notification ?: return false
+        val extras = notif.extras ?: return false
+
+        if (extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) return false
+
+        val pkg = sbn.packageName.lowercase()
+
+        val isTargetApp = pkg.contains("line") ||
+                          pkg.contains("discord") ||
+                          pkg.contains("dialer") ||
+                          pkg.contains("telecom") ||
+                          pkg.contains("messaging") ||
+                          pkg.contains("mms") ||
+                          pkg.contains("twitter") ||
+                          pkg.contains("instagram") ||
+                          pkg.contains("slack") ||
+                          pkg.contains("whatsapp") ||
+                          pkg.contains("gmail") ||
+                          pkg.contains("mail")
+
+        if (!isTargetApp) return false
+
+        val title = extractTitle(null, extras)
+        val text = extractArtist(null, extras)
+        if (title.isBlank() && text.isBlank()) return false
+
+        val notifKey = "${sbn.key}_${sbn.postTime}"
+        if (handledNotificationKeys.get(notifKey) != null) return false
+
+        handledNotificationKeys.put(notifKey, System.currentTimeMillis())
+        return true
+    }
+
+    private fun handleNotificationPopup(sbn: StatusBarNotification) {
+        val notif = sbn.notification ?: return
+        val extras = notif.extras ?: return
+        val pkg = sbn.packageName
+
+        val title = extractTitle(null, extras)
+        val text = extractArtist(null, extras)
+        if (title.isBlank() && text.isBlank()) return
+
+        val appName = getAppDisplayName(pkg)
+        val appIcon = getAppIconBitmap(pkg, notif)
+        val accentColor = getAppAccentColor(pkg)
+
+        serviceScope.launch {
+            isShowingNotificationPopup = true
+            popupDismissJob?.cancel()
+
+            val popupBitmap = drawNotificationPopupOnBitmap(
+                baseBitmap = lastRawArtwork,
+                appName = appName,
+                title = title.ifBlank { appName },
+                text = text.ifBlank { "新しい通知があります" },
+                appIcon = appIcon,
+                accentColor = accentColor,
+                targetSize = 240
+            )
+
+            val jpegBytes = compressToBaselineJpeg(popupBitmap, quality = 65)
+            val displayTitle = "🔔 $appName: $title"
+            val displayArtist = text
+
+            withContext(Dispatchers.Main) {
+                MediaStateHolder.updateTrack(displayTitle, displayArtist, "", pkg, popupBitmap, jpegBytes)
+            }
+
+            BluetoothSppManager.sendMediaPacket(displayTitle, displayArtist, "", jpegBytes)
+            Log.d(TAG, "Notification Popup Sent: [$appName] $title")
+
+            popupDismissJob = launch {
+                delay(5000)
+                isShowingNotificationPopup = false
+                isStandbyScreenActive = false
+                stopDetectionTimestamp = 0L
+                lastSentTrackSignature = ""
+                triggerUpdateDirect()
+            }
+        }
+    }
+
+    private fun registerControllerCallbacks(controllers: List<MediaController>?) {
+        unregisterAllCallbacks()
+        if (controllers == null) return
+
+        for (controller in controllers) {
+            val callback = object : MediaController.Callback() {
+                override fun onMetadataChanged(metadata: MediaMetadata?) {
+                    triggerUpdateWithDebounce(450)
+                }
+
+                override fun onPlaybackStateChanged(state: PlaybackState?) {
+                    triggerUpdateWithDebounce(300)
+                }
+            }
+            try {
+                controller.registerCallback(callback)
+                activeControllers[controller] = callback
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
+    }
+
+    private fun unregisterAllCallbacks() {
+        for ((controller, callback) in activeControllers) {
+            try {
+                controller.unregisterCallback(callback)
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
+        activeControllers.clear()
+    }
+
+    private fun startMonitoringLoop() {
         monitorJob?.cancel()
         monitorJob = serviceScope.launch {
             while (isActive) {
-                delay(800)
+                delay(1000)
+                if (!isShowingNotificationPopup) {
+                    updateActiveMedia()
+                }
+            }
+        }
+    }
+
+    private fun triggerUpdateWithDebounce(delayMs: Long) {
+        if (isShowingNotificationPopup) return
+
+        updateDebounceJob?.cancel()
+        updateDebounceJob = serviceScope.launch {
+            delay(delayMs)
+            updateActiveMedia()
+        }
+    }
+
+    private fun triggerUpdateDirect() {
+        if (!isShowingNotificationPopup) {
+            serviceScope.launch {
                 updateActiveMedia()
             }
         }
     }
 
-    private fun triggerUpdate() {
-        serviceScope.launch {
-            updateActiveMedia()
-        }
-    }
-
     private suspend fun updateActiveMedia() {
+        if (isShowingNotificationPopup) return
         if (!isUpdating.compareAndSet(false, true)) return
 
         try {
             val trackInfo = detectCurrentActiveTrack()
+            val isAudioActive = audioManager?.isMusicActive == true
+            val hasTrackInfo = (trackInfo != null && trackInfo.title.isNotBlank())
 
-            if (trackInfo != null && trackInfo.title.isNotEmpty()) {
-                isPlayingMusic = true
-                // ★曲が変わった時だけ1回だけ送信する（無限ループ送信を完全防止）
-                val isNewTrack = (trackInfo.title != currentTitle || trackInfo.artist != currentArtist)
+            // ★曲情報が存在する場合は、再生・一時停止を問わず確実にアルバムアートを送信！
+            if (hasTrackInfo && trackInfo != null) {
+                stopDetectionTimestamp = 0L
+                isStandbyScreenActive = false
+
+                val trackSignature = "${trackInfo.packageName}_${trackInfo.title}_${trackInfo.artist}"
+                val isNewTrack = (trackSignature != lastSentTrackSignature)
 
                 if (isNewTrack) {
+                    lastSentTrackSignature = trackSignature
                     currentTitle = trackInfo.title
                     currentArtist = trackInfo.artist
+                    currentPackage = trackInfo.packageName
 
-                    val highResBmp = trackInfo.bitmap ?: createPlaceholderBitmap(240, 240)
-                    val squareBmp = processBitmapToStandardBaseline(highResBmp, 240)
+                    lastRawArtwork = trackInfo.bitmap
+                    val rawBitmap = trackInfo.bitmap ?: generatePlaceholderArtwork(trackInfo.title, 240)
+                    val squareBmp = processBitmapToStandardBaseline(rawBitmap, 240)
                     val jpegBytes = compressToBaselineJpeg(squareBmp, quality = 65)
 
                     withContext(Dispatchers.Main) {
-                        MediaStateHolder.updateTrack(trackInfo.title, trackInfo.artist, "", squareBmp, jpegBytes)
+                        MediaStateHolder.updateTrack(trackInfo.title, trackInfo.artist, trackInfo.album, trackInfo.packageName, squareBmp, jpegBytes)
                     }
 
-                    BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, "", jpegBytes)
-                    Log.d(TAG, "Sent New Track ONCE: ${trackInfo.title} (${jpegBytes.size} bytes)")
+                    BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes)
+                    Log.d(TAG, "Sent Track & Art: [${trackInfo.packageName}] ${trackInfo.title} (${jpegBytes.size} bytes)")
                 }
             } else {
-                if (isPlayingMusic) {
-                    isPlayingMusic = false
+                // ⏸️ 曲情報が完全にない場合（3秒経過後にダッシュボードへ）
+                val now = System.currentTimeMillis()
+                val cal = Calendar.getInstance()
+                val currentMinute = cal.get(Calendar.MINUTE)
+                val (batteryPct, isCharging) = getBatteryInfo()
+
+                if (stopDetectionTimestamp == 0L) {
+                    stopDetectionTimestamp = now
+                } else if (!isStandbyScreenActive && (now - stopDetectionTimestamp >= 3000L)) {
+                    isStandbyScreenActive = true
                     currentTitle = ""
                     currentArtist = ""
-                }
+                    currentPackage = ""
+                    lastSentTrackSignature = ""
+                    lastRawArtwork = null
+                    lastSentMinute = currentMinute
+                    lastSentBatteryPct = batteryPct
 
-                val cal = Calendar.getInstance()
-                BluetoothSppManager.sendTimeSyncPacket(
-                    cal.get(Calendar.HOUR_OF_DAY),
-                    cal.get(Calendar.MINUTE),
-                    cal.get(Calendar.SECOND)
-                )
+                    sendStandbyDashboard(cal, batteryPct, isCharging)
+                } else if (isStandbyScreenActive) {
+                    if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5) {
+                        lastSentMinute = currentMinute
+                        lastSentBatteryPct = batteryPct
+                        sendStandbyDashboard(cal, batteryPct, isCharging)
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error in updateActiveMedia", e)
@@ -129,80 +353,144 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
-    data class TrackInfo(val title: String, val artist: String, val bitmap: Bitmap?)
+    private suspend fun sendStandbyDashboard(cal: Calendar, batteryPct: Int, isCharging: Boolean) {
+        val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240)
+        val jpegBytes = compressToBaselineJpeg(dashboardBmp, quality = 65)
+
+        val title = "📱 SMART STANDBY"
+        val artist = if (isCharging) "⚡ Charging $batteryPct% | Ready" else "🔋 Battery $batteryPct% | Ready"
+
+        withContext(Dispatchers.Main) {
+            MediaStateHolder.updateTrack(title, artist, "", "System Standby", dashboardBmp, jpegBytes)
+        }
+
+        BluetoothSppManager.sendMediaPacket(title, artist, "", jpegBytes)
+        Log.d(TAG, "Standby Clock Updated: ${cal.get(Calendar.HOUR_OF_DAY)}:${cal.get(Calendar.MINUTE)}")
+    }
+
+    data class TrackInfo(
+        val title: String,
+        val artist: String,
+        val album: String,
+        val bitmap: Bitmap?,
+        val packageName: String,
+        val isPlaying: Boolean,
+        val lastUpdateTime: Long
+    )
 
     private fun detectCurrentActiveTrack(): TrackInfo? {
+        val candidates = mutableListOf<TrackInfo>()
+
+        // 1. MediaSession
         try {
             val component = ComponentName(this, MediaListenerService::class.java)
             val controllers = sessionManager?.getActiveSessions(component) ?: emptyList()
-            for (controller in controllers) {
-                val metadata = controller.metadata ?: continue
-                val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: ""
-                val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
 
-                if (title.isNotEmpty()) {
-                    var bmp: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-                        ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+            for (c in controllers) {
+                val metadata = c.metadata ?: continue
+                val state = c.playbackState
+                val isPlaying = state?.state == PlaybackState.STATE_PLAYING || 
+                                state?.state == PlaybackState.STATE_BUFFERING
+                val updateTime = state?.lastPositionUpdateTime ?: 0L
 
-                    if (bmp == null) {
-                        val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
-                            ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
-                            ?: metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI)
-                        if (!uriStr.isNullOrEmpty()) {
-                            bmp = fetchBitmapFromUri(uriStr)
-                        }
-                    }
+                val title = extractTitle(metadata, null)
+                val artist = extractArtist(metadata, null)
+                val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
+                val pkg = c.packageName ?: "unknown"
 
-                    if (bmp == null) {
-                        bmp = getNotificationHighResArt(title)
-                    }
+                if (title.isNotBlank()) {
+                    val bitmap = extractArtworkFromMetadata(metadata)
+                        ?: getNotificationHighResArtFallback(title)
 
-                    if (bmp == null) {
-                        bmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
-                    }
-
-                    return TrackInfo(title, artist, bmp)
+                    candidates.add(TrackInfo(title, artist, album, bitmap, pkg, isPlaying, updateTime))
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "MediaSession check error", e)
+            Log.e(TAG, "MediaSession search error", e)
         }
 
-        val notifications = activeNotifications ?: return null
-        for (sbn in notifications) {
-            val notif = sbn.notification ?: continue
-            val extras = notif.extras ?: continue
-            val isMedia = extras.containsKey(Notification.EXTRA_MEDIA_SESSION)
-            val pkg = sbn.packageName.lowercase()
+        // 2. 通知バー
+        val notifications = activeNotifications
+        if (notifications != null) {
+            for (sbn in notifications) {
+                val notif = sbn.notification ?: continue
+                val extras = notif.extras ?: continue
+                val isMedia = extras.containsKey(Notification.EXTRA_MEDIA_SESSION)
+                val pkg = sbn.packageName.lowercase()
 
-            if (isMedia || pkg.contains("spotify") || pkg.contains("youtube") || pkg.contains("music") || pkg.contains("audio")) {
-                val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
-                val artist = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+                if (isMedia || pkg.contains("spotify") || pkg.contains("youtube") ||
+                    pkg.contains("music") || pkg.contains("audio") || pkg.contains("sound") || pkg.contains("radiko")) {
 
-                if (title.isNotEmpty()) {
-                    val bmp = getHighResFromNotificationExtras(extras, notif)
-                    return TrackInfo(title, artist, bmp)
+                    val title = extractTitle(null, extras)
+                    val artist = extractArtist(null, extras)
+                    val album = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: ""
+                    val postTime = sbn.postTime
+
+                    if (title.isNotBlank()) {
+                        if (candidates.none { it.packageName.equals(pkg, ignoreCase = true) }) {
+                            val bitmap = extractArtworkFromNotification(extras, notif)
+                            candidates.add(TrackInfo(title, artist, album, bitmap, pkg, true, postTime))
+                        }
+                    }
                 }
             }
         }
 
-        return null
+        if (candidates.isEmpty()) return null
+
+        return candidates
+            .sortedWith(compareByDescending<TrackInfo> { it.isPlaying }
+                .thenByDescending { it.lastUpdateTime })
+            .firstOrNull()
     }
 
-    private fun getNotificationHighResArt(expectedTitle: String): Bitmap? {
-        val notifications = activeNotifications ?: return null
-        for (sbn in notifications) {
-            val notif = sbn.notification ?: continue
-            val extras = notif.extras ?: continue
-            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
-            if (title.contains(expectedTitle, ignoreCase = true) || expectedTitle.contains(title, ignoreCase = true)) {
-                return getHighResFromNotificationExtras(extras, notif)
-            }
+    private fun extractTitle(metadata: MediaMetadata?, extras: Bundle?): String {
+        metadata?.let {
+            it.getString(MediaMetadata.METADATA_KEY_TITLE)?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            it.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)?.takeIf { s -> s.isNotBlank() }?.let { return it }
         }
+        extras?.let {
+            it.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
+        }
+        return ""
+    }
+
+    private fun extractArtist(metadata: MediaMetadata?, extras: Bundle?): String {
+        metadata?.let {
+            it.getString(MediaMetadata.METADATA_KEY_ARTIST)?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            it.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            it.getString(MediaMetadata.METADATA_KEY_AUTHOR)?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            it.getString(MediaMetadata.METADATA_KEY_COMPOSER)?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            it.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE)?.takeIf { s -> s.isNotBlank() }?.let { return it }
+        }
+        extras?.let {
+            it.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            it.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
+        }
+        return ""
+    }
+
+    private fun extractArtworkFromMetadata(metadata: MediaMetadata): Bitmap? {
+        metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)?.let { return it }
+        metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)?.let { return it }
+
+        val uriStr = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+            ?: metadata.getString(MediaMetadata.METADATA_KEY_ART_URI)
+            ?: metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI)
+        if (!uriStr.isNullOrEmpty()) {
+            fetchBitmapFromUri(uriStr)?.let { return it }
+        }
+
+        metadata.description?.iconBitmap?.let { return it }
+        metadata.description?.iconUri?.toString()?.let { uri ->
+            fetchBitmapFromUri(uri)?.let { return it }
+        }
+
+        metadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)?.let { return it }
         return null
     }
 
-    private fun getHighResFromNotificationExtras(extras: Bundle, notif: Notification): Bitmap? {
+    private fun extractArtworkFromNotification(extras: Bundle, notif: Notification): Bitmap? {
         if (extras.containsKey(Notification.EXTRA_PICTURE)) {
             val pic = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 extras.getParcelable(Notification.EXTRA_PICTURE, Bitmap::class.java)
@@ -213,22 +501,35 @@ class MediaListenerService : NotificationListenerService() {
             if (pic != null) return pic
         }
 
-        val largeIcon = notif.getLargeIcon()
-        if (largeIcon != null) {
-            val bmp = largeIcon.loadDrawable(this)?.toBitmap()
-            if (bmp != null) return bmp
+        notif.getLargeIcon()?.let { icon ->
+            icon.loadDrawable(this)?.toBitmap()?.let { return it }
         }
 
         return null
     }
 
+    private fun getNotificationHighResArtFallback(expectedTitle: String): Bitmap? {
+        val notifications = activeNotifications ?: return null
+        for (sbn in notifications) {
+            val notif = sbn.notification ?: continue
+            val extras = notif.extras ?: continue
+            val title = extractTitle(null, extras)
+            if (title.contains(expectedTitle, ignoreCase = true) || expectedTitle.contains(title, ignoreCase = true)) {
+                extractArtworkFromNotification(extras, notif)?.let { return it }
+            }
+        }
+        return null
+    }
+
     private fun fetchBitmapFromUri(uriStr: String): Bitmap? {
         return try {
-            if (uriStr.startsWith("http://") || uriStr.startsWith("https://")) {
+            val uri = Uri.parse(uriStr)
+            if (uri.scheme == "http" || uri.scheme == "https") {
                 val url = URL(uriStr)
                 val conn = url.openConnection() as HttpURLConnection
                 conn.connectTimeout = 3000
                 conn.readTimeout = 3000
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0")
                 conn.instanceFollowRedirects = true
                 conn.doInput = true
                 conn.connect()
@@ -236,7 +537,6 @@ class MediaListenerService : NotificationListenerService() {
                     BitmapFactory.decodeStream(inputStream)
                 }
             } else {
-                val uri = Uri.parse(uriStr)
                 contentResolver.openInputStream(uri)?.use { inputStream ->
                     BitmapFactory.decodeStream(inputStream)
                 }
@@ -246,10 +546,201 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
+    private fun drawStandbyDashboardBitmap(
+        cal: Calendar,
+        batteryPct: Int,
+        isCharging: Boolean,
+        size: Int = 240
+    ): Bitmap {
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
+        val canvas = Canvas(bmp)
+
+        canvas.drawColor(Color.rgb(15, 18, 26))
+
+        val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(90, 0, 210, 255)
+            style = Paint.Style.STROKE
+            strokeWidth = 1.5f
+        }
+        canvas.drawCircle(120f, 120f, 112f, ringPaint)
+
+        val dateStr = SimpleDateFormat("MM/dd EEE", Locale.US).format(cal.time).uppercase()
+        val datePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(140, 165, 195)
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+        canvas.drawText(dateStr, 120f, 50f, datePaint)
+
+        val timeStr = SimpleDateFormat("HH:mm", Locale.US).format(cal.time)
+        val timePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 40f
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+        canvas.drawText(timeStr, 120f, 102f, timePaint)
+
+        val battStr = if (isCharging) "⚡ $batteryPct%" else "🔋 $batteryPct%"
+        val battColor = when {
+            isCharging -> Color.rgb(52, 199, 89)
+            batteryPct <= 20 -> Color.rgb(255, 69, 58)
+            else -> Color.rgb(0, 210, 255)
+        }
+        val battPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = battColor
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+        canvas.drawText(battStr, 120f, 136f, battPaint)
+
+        return bmp
+    }
+
+    private fun getBatteryInfo(): Pair<Int, Boolean> {
+        val ifilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val batteryStatus: Intent? = registerReceiver(null, ifilter)
+        val level: Int = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale: Int = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val batteryPct = if (level >= 0 && scale > 0) (level * 100 / scale) else 0
+
+        val status: Int = batteryStatus?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                         status == BatteryManager.BATTERY_STATUS_FULL
+        return Pair(batteryPct, isCharging)
+    }
+
+    private fun drawNotificationPopupOnBitmap(
+        baseBitmap: Bitmap?,
+        appName: String,
+        title: String,
+        text: String,
+        appIcon: Bitmap?,
+        accentColor: Int,
+        targetSize: Int = 240
+    ): Bitmap {
+        val result = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
+        val canvas = Canvas(result)
+
+        if (baseBitmap != null) {
+            val minEdge = minOf(baseBitmap.width, baseBitmap.height)
+            val cropX = (baseBitmap.width - minEdge) / 2
+            val cropY = (baseBitmap.height - minEdge) / 2
+            val cropped = Bitmap.createBitmap(baseBitmap, cropX, cropY, minEdge, minEdge)
+            val scaled = Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
+            canvas.drawBitmap(scaled, 0f, 0f, null)
+            canvas.drawColor(Color.argb(160, 0, 0, 0))
+        } else {
+            canvas.drawColor(Color.rgb(18, 20, 28))
+        }
+
+        val cardRect = RectF(16f, 22f, 224f, 158f)
+        val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(225, 25, 27, 36)
+            style = Paint.Style.FILL
+        }
+        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = accentColor
+            style = Paint.Style.STROKE
+            strokeWidth = 2.5f
+        }
+        canvas.drawRoundRect(cardRect, 18f, 18f, cardPaint)
+        canvas.drawRoundRect(cardRect, 18f, 18f, borderPaint)
+
+        val headerY = 46f
+        var textStartX = 30f
+        if (appIcon != null) {
+            val iconScaled = Bitmap.createScaledBitmap(appIcon, 20, 20, true)
+            canvas.drawBitmap(iconScaled, 28f, headerY - 15f, null)
+            textStartX = 54f
+        }
+
+        val appNamePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = accentColor
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        canvas.drawText(appName, textStartX, headerY, appNamePaint)
+
+        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val safeTitle = ellipsizeText(title, titlePaint, 175f)
+        canvas.drawText(safeTitle, 28f, 76f, titlePaint)
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(215, 220, 235)
+            textSize = 12f
+            typeface = Typeface.DEFAULT
+        }
+        val safeText1 = ellipsizeText(text, textPaint, 175f)
+        canvas.drawText(safeText1, 28f, 102f, textPaint)
+
+        val remaining = text.drop(safeText1.length).trim()
+        if (remaining.isNotEmpty()) {
+            val safeText2 = ellipsizeText(remaining, textPaint, 175f)
+            canvas.drawText(safeText2, 28f, 122f, textPaint)
+        }
+
+        return result
+    }
+
+    private fun ellipsizeText(text: String, paint: Paint, maxWidth: Float): String {
+        if (paint.measureText(text) <= maxWidth) return text
+        var len = text.length
+        while (len > 0 && paint.measureText(text.take(len) + "...") > maxWidth) {
+            len--
+        }
+        return text.take(len) + "..."
+    }
+
+    private fun getAppDisplayName(packageName: String): String {
+        return when {
+            packageName.contains("line") -> "LINE"
+            packageName.contains("discord") -> "Discord"
+            packageName.contains("twitter") || packageName.contains("x") -> "X"
+            packageName.contains("instagram") -> "Instagram"
+            packageName.contains("dialer") || packageName.contains("telecom") -> "着信"
+            packageName.contains("gm") || packageName.contains("mail") -> "Gmail"
+            packageName.contains("slack") -> "Slack"
+            packageName.contains("messaging") || packageName.contains("mms") -> "メッセージ"
+            packageName.contains("whatsapp") -> "WhatsApp"
+            else -> "通知"
+        }
+    }
+
+    private fun getAppAccentColor(packageName: String): Int {
+        return when {
+            packageName.contains("line") -> Color.rgb(6, 199, 85)
+            packageName.contains("discord") -> Color.rgb(88, 101, 242)
+            packageName.contains("twitter") || packageName.contains("x") -> Color.rgb(29, 161, 242)
+            packageName.contains("instagram") -> Color.rgb(225, 48, 108)
+            packageName.contains("dialer") || packageName.contains("telecom") -> Color.rgb(52, 199, 89)
+            packageName.contains("gm") || packageName.contains("mail") -> Color.rgb(234, 67, 53)
+            packageName.contains("slack") -> Color.rgb(74, 21, 75)
+            packageName.contains("whatsapp") -> Color.rgb(37, 211, 102)
+            else -> Color.rgb(0, 210, 255)
+        }
+    }
+
+    private fun getAppIconBitmap(packageName: String, notif: Notification): Bitmap? {
+        return try {
+            notif.getSmallIcon()?.loadDrawable(this)?.toBitmap()
+                ?: packageManager.getApplicationIcon(packageName).toBitmap()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     private fun processBitmapToStandardBaseline(source: Bitmap, targetSize: Int = 240): Bitmap {
         val minEdge = minOf(source.width, source.height)
         val cropX = (source.width - minEdge) / 2
         val cropY = (source.height - minEdge) / 2
+
         val cropped = Bitmap.createBitmap(source, cropX, cropY, minEdge, minEdge)
         val scaled = Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
 
@@ -261,16 +752,30 @@ class MediaListenerService : NotificationListenerService() {
         return result
     }
 
+    private fun generatePlaceholderArtwork(title: String, size: Int = 240): Bitmap {
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(Color.rgb(25, 30, 45))
+
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(0, 210, 255)
+            textSize = 72f
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+
+        val initial = if (title.isNotBlank()) title.take(1).uppercase() else "♪"
+        val bounds = Rect()
+        paint.getTextBounds(initial, 0, initial.length, bounds)
+        val yPos = (size / 2) + (bounds.height() / 2)
+
+        canvas.drawText(initial, size / 2f, yPos.toFloat(), paint)
+        return bmp
+    }
+
     private fun compressToBaselineJpeg(bitmap: Bitmap, quality: Int = 65): ByteArray {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
         return stream.toByteArray()
-    }
-
-    private fun createPlaceholderBitmap(width: Int, height: Int): Bitmap {
-        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
-        val canvas = Canvas(bmp)
-        canvas.drawColor(Color.DKGRAY)
-        return bmp
     }
 }
