@@ -4,10 +4,13 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -62,7 +65,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@SuppressLint("MissingPermission")
+@SuppressLint("MissingPermission", "BatteryLife")
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen() {
@@ -86,6 +89,12 @@ fun MainScreen() {
         mutableStateOf(NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName))
     }
 
+    // バッテリー最適化除外の確認
+    val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    var isIgnoringBatteryOptimizations by remember {
+        mutableStateOf(powerManager.isIgnoringBatteryOptimizations(context.packageName))
+    }
+
     val btPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
@@ -107,6 +116,7 @@ fun MainScreen() {
 
     DisposableEffect(Unit) {
         isNotificationAccessGranted = NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+        isIgnoringBatteryOptimizations = powerManager.isIgnoringBatteryOptimizations(context.packageName)
         onDispose { }
     }
 
@@ -126,14 +136,16 @@ fun MainScreen() {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        if (!isNotificationAccessGranted || !hasBtPermission) {
+        // 権限 ＆ バッテリー設定カード
+        if (!isNotificationAccessGranted || !hasBtPermission || !isIgnoringBatteryOptimizations) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF332020)),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    Text("必要な権限を設定してください", fontWeight = FontWeight.Bold, color = Color(0xFFFF6B6B))
+                    Text("必要な権限・バックグラウンド設定", fontWeight = FontWeight.Bold, color = Color(0xFFFF6B6B))
                     Spacer(modifier = Modifier.height(6.dp))
+                    
                     if (!isNotificationAccessGranted) {
                         Button(
                             onClick = {
@@ -160,6 +172,21 @@ fun MainScreen() {
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text("2. Bluetooth接続権限を許可")
+                        }
+                    }
+                    if (!isIgnoringBatteryOptimizations) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Button(
+                            onClick = {
+                                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                    data = Uri.parse("package:${context.packageName}")
+                                }
+                                context.startActivity(intent)
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF57C00)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("3. バックグラウンド停止防止（電池最適化解除）")
                         }
                     }
                 }
