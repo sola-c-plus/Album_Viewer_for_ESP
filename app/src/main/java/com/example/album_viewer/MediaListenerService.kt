@@ -46,7 +46,6 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     private var sessionManager: MediaSessionManager? = null
-    private var audioManager: AudioManager? = null
     private var monitorJob: Job? = null
     private var updateDebounceJob: Job? = null
     private var popupDismissJob: Job? = null
@@ -78,7 +77,6 @@ class MediaListenerService : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         sessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val component = ComponentName(this, MediaListenerService::class.java)
         try {
             sessionManager?.addOnActiveSessionsChangedListener(sessionListener, component)
@@ -256,7 +254,7 @@ class MediaListenerService : NotificationListenerService() {
         monitorJob?.cancel()
         monitorJob = serviceScope.launch {
             while (isActive) {
-                delay(800)
+                delay(600)
                 if (!isShowingNotificationPopup) {
                     updateActiveMedia()
                 }
@@ -288,12 +286,9 @@ class MediaListenerService : NotificationListenerService() {
 
         try {
             val trackInfo = detectCurrentActiveTrack()
-            val isAudioActive = audioManager?.isMusicActive == true
 
-            // ★真の再生中判定：曲が存在し、かつ実際に再生中（PLAYING または 音が出ている）
-            val isMusicActuallyPlaying = trackInfo != null && 
-                                         trackInfo.title.isNotBlank() && 
-                                         (trackInfo.isPlaying || isAudioActive)
+            // ★真の再生中判定：曲が存在し、かつ明示的に再生中（isPlaying == true）
+            val isMusicActuallyPlaying = (trackInfo != null && trackInfo.title.isNotBlank() && trackInfo.isPlaying)
 
             if (isMusicActuallyPlaying && trackInfo != null) {
                 // ==========================================
@@ -335,7 +330,7 @@ class MediaListenerService : NotificationListenerService() {
                 if (stopDetectionTimestamp == 0L) {
                     stopDetectionTimestamp = now
                 } else if (!isStandbyScreenActive && (now - stopDetectionTimestamp >= 1500L)) {
-                    // ★一時停止から1.5秒経過！時計（スマートダッシュボード）へ切り替え
+                    // ★一時停止から1.5秒経過！時計（スマートダッシュボード）へ即時切り替え
                     isStandbyScreenActive = true
                     lastSentTrackSignature = "" // 再生再開時に即座にアルバムアートを再送できるようにリセット
                     currentTitle = ""
@@ -387,10 +382,14 @@ class MediaListenerService : NotificationListenerService() {
         val lastUpdateTime: Long
     )
 
+    /**
+     * 各アプリのMediaSessionおよび通知ボタン(Play/Pause)を精密解析して再生判定
+     */
     private fun detectCurrentActiveTrack(): TrackInfo? {
         val candidates = mutableListOf<TrackInfo>()
+        val notifications = activeNotifications
 
-        // 1. MediaSession
+        // 1. MediaSessionコントローラの探索
         try {
             val component = ComponentName(this, MediaListenerService::class.java)
             val controllers = sessionManager?.getActiveSessions(component) ?: emptyList()
@@ -398,17 +397,32 @@ class MediaListenerService : NotificationListenerService() {
             for (c in controllers) {
                 val metadata = c.metadata ?: continue
                 val state = c.playbackState
-                val isPlaying = state?.state == PlaybackState.STATE_PLAYING || 
-                                state?.state == PlaybackState.STATE_BUFFERING
-                val updateTime = state?.lastPositionUpdateTime ?: 0L
-
-                val title = extractTitle(metadata, null)
-                val artist = extractArtist(metadata, null)
-                val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
                 val pkg = c.packageName ?: "unknown"
+
+                // 該当アプリの通知を探す
+                val matchingSbn = notifications?.firstOrNull { it.packageName.equals(pkg, ignoreCase = true) }
+                val notifPlayingState = matchingSbn?.let { isNotificationPlaying(it.notification) }
+
+                // ★再生判定の精密決定：
+                // ① 通知にPlay/Pauseボタンがあればそれが最優先
+                // ② なければ PlaybackState の state と playbackSpeed で判定
+                val isPlaying = if (notifPlayingState != null) {
+                    notifPlayingState
+                } else {
+                    val isStatePlay = (state?.state == PlaybackState.STATE_PLAYING || 
+                                       state?.state == PlaybackState.STATE_BUFFERING)
+                    val isSpeedNormal = (state?.playbackSpeed ?: 1.0f) > 0f
+                    isStatePlay && isSpeedNormal
+                }
+
+                val updateTime = state?.lastPositionUpdateTime ?: matchingSbn?.postTime ?: 0L
+                val title = extractTitle(metadata, matchingSbn?.notification?.extras)
+                val artist = extractArtist(metadata, matchingSbn?.notification?.extras)
+                val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
 
                 if (title.isNotBlank()) {
                     val bitmap = extractArtworkFromMetadata(metadata)
+                        ?: matchingSbn?.let { extractArtworkFromNotification(it.notification.extras, it.notification) }
                         ?: getNotificationHighResArtFallback(title)
 
                     candidates.add(TrackInfo(title, artist, album, bitmap, pkg, isPlaying, updateTime))
@@ -418,8 +432,7 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "MediaSession search error", e)
         }
 
-        // 2. 通知バー
-        val notifications = activeNotifications
+        // 2. 通知バーのメディア通知の探索 (MediaSessionを持たないアプリの補完)
         if (notifications != null) {
             for (sbn in notifications) {
                 val notif = sbn.notification ?: continue
@@ -435,10 +448,13 @@ class MediaListenerService : NotificationListenerService() {
                     val album = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: ""
                     val postTime = sbn.postTime
 
+                    // 通知の再生ボタン解析
+                    val isPlaying = isNotificationPlaying(notif) ?: true
+
                     if (title.isNotBlank()) {
                         if (candidates.none { it.packageName.equals(pkg, ignoreCase = true) }) {
                             val bitmap = extractArtworkFromNotification(extras, notif)
-                            candidates.add(TrackInfo(title, artist, album, bitmap, pkg, true, postTime))
+                            candidates.add(TrackInfo(title, artist, album, bitmap, pkg, isPlaying, postTime))
                         }
                     }
                 }
@@ -452,6 +468,26 @@ class MediaListenerService : NotificationListenerService() {
             .sortedWith(compareByDescending<TrackInfo> { it.isPlaying }
                 .thenByDescending { it.lastUpdateTime })
             .firstOrNull()
+    }
+
+    /**
+     * ★通知のアクションボタンを解析して「再生中」か「一時停止中」かを100%特定
+     */
+    private fun isNotificationPlaying(notif: Notification?): Boolean? {
+        if (notif == null) return null
+        val actions = notif.actions ?: return null
+        for (action in actions) {
+            val title = action.title?.toString()?.lowercase() ?: ""
+            // 「再生」「Play」ボタンが表示されている ＝ 今は一時停止中！
+            if (title.contains("play") || title.contains("再生") || title.contains("resume") || title.contains("再開")) {
+                return false
+            }
+            // 「一時停止」「Pause」ボタンが表示されている ＝ 今は再生中！
+            if (title.contains("pause") || title.contains("一時停止") || title.contains("stop") || title.contains("停止")) {
+                return true
+            }
+        }
+        return null
     }
 
     private fun extractTitle(metadata: MediaMetadata?, extras: Bundle?): String {
