@@ -12,7 +12,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.io.IOException
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -78,7 +77,15 @@ object BluetoothSppManager {
         }
     }
 
-    fun sendMediaPacket(title: String, artist: String, album: String, jpegBytes: ByteArray?) {
+    // ★ rgb565Color (アクセント色) と rgb565BgColor (文字裏背景色) を送信
+    fun sendMediaPacket(
+        title: String,
+        artist: String,
+        album: String,
+        jpegBytes: ByteArray?,
+        rgb565Color: Int = 0x067F,
+        rgb565BgColor: Int = 0x0000
+    ) {
         scope.launch {
             if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
 
@@ -86,17 +93,20 @@ object BluetoothSppManager {
                 try {
                     val out = outputStream ?: return@withLock
 
-                    // 1. メタデータ送信
-                    val metadataMap = mapOf("title" to title, "artist" to artist, "album" to album)
+                    val metadataMap = mapOf(
+                        "title" to title,
+                        "artist" to artist,
+                        "album" to album,
+                        "color" to rgb565Color,
+                        "bg" to rgb565BgColor
+                    )
                     val jsonBytes = gson.toJson(metadataMap).toByteArray(Charsets.UTF_8)
                     val metaPacket = buildPacket(0x01.toByte(), jsonBytes)
                     out.write(metaPacket)
                     out.flush()
 
-                    // ESP32側のメタデータ処理完了を待つ (180ms)
                     delay(180)
 
-                    // 2. JPEG画像送信 (128バイト分割 + 12ms待機で確実転送)
                     if (jpegBytes != null && jpegBytes.isNotEmpty()) {
                         val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
                         var offset = 0
@@ -108,7 +118,6 @@ object BluetoothSppManager {
                             offset += len
                             delay(12)
                         }
-                        Log.d(TAG, "Safe JPEG Sent: $title (${jpegBytes.size} bytes)")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to send media packet", e)
@@ -122,7 +131,6 @@ object BluetoothSppManager {
     fun sendTimeSyncPacket(hour: Int, minute: Int, second: Int) {
         scope.launch {
             if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
-
             if (!sendMutex.tryLock()) return@launch
 
             try {

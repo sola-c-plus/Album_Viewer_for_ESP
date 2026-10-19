@@ -67,7 +67,6 @@ class MediaListenerService : NotificationListenerService() {
 
     private var lastRawArtwork: Bitmap? = null
 
-    // 停止後判定用（一時的なバッファリングや曲間スキップ時のチラつきを防ぐため2.5秒）
     private var stopDetectionTimestamp: Long = 0L
     private var isStandbyScreenActive = false
     private var lastSentMinute = -1
@@ -93,7 +92,6 @@ class MediaListenerService : NotificationListenerService() {
         serviceScope.launch {
             BluetoothSppManager.connectionStatus.collect { status ->
                 if (status == ConnectionStatus.CONNECTED) {
-                    Log.d(TAG, "Bluetooth Connected -> Resyncing...")
                     delay(800)
                     isStandbyScreenActive = false
                     currentTitle = ""
@@ -122,12 +120,10 @@ class MediaListenerService : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
-
         if (shouldShowNotificationPopup(sbn)) {
             handleNotificationPopup(sbn)
             return
         }
-
         triggerUpdateWithDebounce(250)
     }
 
@@ -141,23 +137,15 @@ class MediaListenerService : NotificationListenerService() {
 
         val notif = sbn.notification ?: return false
         val extras = notif.extras ?: return false
-
         if (extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) return false
 
         val pkg = sbn.packageName.lowercase()
-
-        val isTargetApp = pkg.contains("line") ||
-                          pkg.contains("discord") ||
-                          pkg.contains("dialer") ||
-                          pkg.contains("telecom") ||
-                          pkg.contains("messaging") ||
-                          pkg.contains("mms") ||
-                          pkg.contains("twitter") ||
-                          pkg.contains("instagram") ||
-                          pkg.contains("slack") ||
-                          pkg.contains("whatsapp") ||
-                          pkg.contains("gmail") ||
-                          pkg.contains("mail")
+        val isTargetApp = pkg.contains("line") || pkg.contains("discord") ||
+                          pkg.contains("dialer") || pkg.contains("telecom") ||
+                          pkg.contains("messaging") || pkg.contains("mms") ||
+                          pkg.contains("twitter") || pkg.contains("instagram") ||
+                          pkg.contains("slack") || pkg.contains("whatsapp") ||
+                          pkg.contains("gmail") || pkg.contains("mail")
 
         if (!isTargetApp) return false
 
@@ -167,7 +155,6 @@ class MediaListenerService : NotificationListenerService() {
 
         val notifKey = "${sbn.key}_${sbn.postTime}"
         if (handledNotificationKeys.get(notifKey) != null) return false
-
         handledNotificationKeys.put(notifKey, System.currentTimeMillis())
         return true
     }
@@ -202,13 +189,14 @@ class MediaListenerService : NotificationListenerService() {
             val jpegBytes = compressToSafeBaselineJpeg(popupBitmap)
             val displayTitle = "🔔 $appName: $title"
             val displayArtist = text
+            val rgb565Color = colorToRgb565(accentColor)
+            val rgb565Bg = 0x0000 // 通知時は黒背景
 
             withContext(Dispatchers.Main) {
                 MediaStateHolder.updateTrack(displayTitle, displayArtist, "", pkg, popupBitmap, jpegBytes)
             }
 
-            BluetoothSppManager.sendMediaPacket(displayTitle, displayArtist, "", jpegBytes)
-            Log.d(TAG, "Notification Popup Sent: [$appName] $title")
+            BluetoothSppManager.sendMediaPacket(displayTitle, displayArtist, "", jpegBytes, rgb565Color, rgb565Bg)
 
             popupDismissJob = launch {
                 delay(5000)
@@ -269,7 +257,6 @@ class MediaListenerService : NotificationListenerService() {
 
     private fun triggerUpdateWithDebounce(delayMs: Long) {
         if (isShowingNotificationPopup) return
-
         updateDebounceJob?.cancel()
         updateDebounceJob = serviceScope.launch {
             delay(delayMs)
@@ -294,13 +281,9 @@ class MediaListenerService : NotificationListenerService() {
             val isMusicActuallyPlaying = (trackInfo != null && trackInfo.title.isNotBlank() && trackInfo.isPlaying)
 
             if (isMusicActuallyPlaying && trackInfo != null) {
-                // ==========================================
-                // 🎵 1. 音楽再生中（PLAYING）
-                // ==========================================
                 stopDetectionTimestamp = 0L
                 isStandbyScreenActive = false
 
-                // ★画像の有無と画像サイズもシグネチャに含める
                 val hasArt = (trackInfo.bitmap != null)
                 val artSignature = trackInfo.bitmap?.let { "${it.width}x${it.height}_${it.allocationByteCount}" } ?: "no_art"
                 val trackSignature = "${trackInfo.packageName}_${trackInfo.title}_${trackInfo.artist}_${hasArt}_$artSignature"
@@ -316,26 +299,23 @@ class MediaListenerService : NotificationListenerService() {
                     lastRawArtwork = trackInfo.bitmap
                     val rawBitmap = trackInfo.bitmap ?: generatePlaceholderArtwork(trackInfo.title, 240)
                     val squareBmp = processBitmapToStandardBaseline(rawBitmap, 240)
-                    
-                    // ESP32の24KBバッファを超えないセーフ圧縮
                     val jpegBytes = compressToSafeBaselineJpeg(squareBmp)
+
+                    // ★画像から「アクセントカラー」と「文字裏の背景色」を自動抽出
+                    val (rgb565Accent, rgb565Bg) = extractOptimalPalette(squareBmp)
 
                     withContext(Dispatchers.Main) {
                         MediaStateHolder.updateTrack(trackInfo.title, trackInfo.artist, trackInfo.album, trackInfo.packageName, squareBmp, jpegBytes)
                     }
 
-                    BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes)
-                    Log.d(TAG, "Sent Track & Art: [${trackInfo.packageName}] ${trackInfo.title} (Art: $hasArt, Size: ${jpegBytes.size} bytes)")
+                    BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes, rgb565Accent, rgb565Bg)
+                    Log.d(TAG, "Sent Track & Art & Colors(Accent: 0x${Integer.toHexString(rgb565Accent)}, Bg: 0x${Integer.toHexString(rgb565Bg)}): ${trackInfo.title}")
 
-                    // 画像未取得時は遅延リトライを実行
                     if (!hasArt) {
                         scheduleArtworkRetry()
                     }
                 }
             } else {
-                // ==========================================
-                // ⏸️ 2. 音楽停止中（一時停止または完全停止）
-                // ==========================================
                 val now = System.currentTimeMillis()
                 val cal = Calendar.getInstance()
                 val currentMinute = cal.get(Calendar.MINUTE)
@@ -353,7 +333,6 @@ class MediaListenerService : NotificationListenerService() {
                     lastSentBatteryPct = batteryPct
 
                     sendStandbyDashboard(cal, batteryPct, isCharging)
-                    Log.d(TAG, "Music Stopped/Paused -> Switched to Standby Clock")
                 } else if (isStandbyScreenActive) {
                     if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5) {
                         lastSentMinute = currentMinute
@@ -385,13 +364,66 @@ class MediaListenerService : NotificationListenerService() {
 
         val title = "📱 SMART STANDBY"
         val artist = if (isCharging) "⚡ Charging $batteryPct% | Ready" else "🔋 Battery $batteryPct% | Ready"
+        val defaultCyanRgb565 = colorToRgb565(Color.rgb(0, 210, 255))
+        val blackBgRgb565 = 0x0000
 
         withContext(Dispatchers.Main) {
             MediaStateHolder.updateTrack(title, artist, "", "System Standby", dashboardBmp, jpegBytes)
         }
 
-        BluetoothSppManager.sendMediaPacket(title, artist, "", jpegBytes)
-        Log.d(TAG, "Standby Clock Updated: ${cal.get(Calendar.HOUR_OF_DAY)}:${cal.get(Calendar.MINUTE)}")
+        BluetoothSppManager.sendMediaPacket(title, artist, "", jpegBytes, defaultCyanRgb565, blackBgRgb565)
+    }
+
+    /**
+     * ★画像から「アクセントカラー」と「文字裏の背景色」のペアを抽出
+     */
+    private fun extractOptimalPalette(bitmap: Bitmap): Pair<Int, Int> {
+        return try {
+            val scaled = Bitmap.createScaledBitmap(bitmap, 24, 24, false)
+            val pixels = IntArray(24 * 24)
+            scaled.getPixels(pixels, 0, 24, 0, 0, 24, 24)
+
+            var bestColor = Color.rgb(0, 210, 255)
+            var maxScore = -1f
+            val hsv = FloatArray(3)
+
+            for (pixel in pixels) {
+                Color.colorToHSV(pixel, hsv)
+                val s = hsv[1]
+                val v = hsv[2]
+
+                if (v < 0.25f || (s < 0.15f && v > 0.85f)) continue
+
+                val score = s * 0.7f + v * 0.3f
+                if (score > maxScore) {
+                    maxScore = score
+                    bestColor = pixel
+                }
+            }
+
+            // 1. アクセントカラー（明度0.85、彩度0.45以上にブーストしてくっきり発色）
+            Color.colorToHSV(bestColor, hsv)
+            if (hsv[2] < 0.85f) hsv[2] = 0.85f
+            if (hsv[1] < 0.45f) hsv[1] = 0.45f
+            val accentRgb565 = colorToRgb565(Color.HSVToColor(hsv))
+
+            // 2. 文字裏の背景色（同系統の色相で、明度0.12の極暗色＝ディープトーン）
+            // これにより文字の白(TFT_WHITE)が完璧に読め、かつジャケットと一体化する
+            hsv[1] = (hsv[1] * 0.8f).coerceIn(0.35f, 0.65f) // 彩度を適度に残す
+            hsv[2] = 0.12f // 12%の明るさ（真っ黒に近いがほんのり上品に色がつく）
+            val bgRgb565 = colorToRgb565(Color.HSVToColor(hsv))
+
+            Pair(accentRgb565, bgRgb565)
+        } catch (e: Exception) {
+            Pair(colorToRgb565(Color.rgb(0, 210, 255)), 0x0000)
+        }
+    }
+
+    private fun colorToRgb565(colorInt: Int): Int {
+        val r = (Color.red(colorInt) shr 3) and 0x1F
+        val g = (Color.green(colorInt) shr 2) and 0x3F
+        val b = (Color.blue(colorInt) shr 3) and 0x1F
+        return (r shl 11) or (g shl 5) or b
     }
 
     data class TrackInfo(
@@ -408,7 +440,6 @@ class MediaListenerService : NotificationListenerService() {
         val candidates = mutableListOf<TrackInfo>()
         val notifications = activeNotifications ?: emptyArray()
 
-        // 1. MediaSession コントローラの走査
         try {
             val component = ComponentName(this, MediaListenerService::class.java)
             val controllers = sessionManager?.getActiveSessions(component) ?: emptyList()
@@ -446,7 +477,6 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "MediaSession search error", e)
         }
 
-        // 2. 通知バーのメディア通知の探索
         for (sbn in notifications) {
             val notif = sbn.notification ?: continue
             val extras = notif.extras ?: continue
@@ -464,7 +494,6 @@ class MediaListenerService : NotificationListenerService() {
                 val artist = extractArtist(null, extras)
                 val album = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: ""
                 val postTime = sbn.postTime
-
                 val isPlaying = isNotificationShowingPauseButton(notif) ?: true
 
                 if (title.isNotBlank()) {
@@ -525,7 +554,6 @@ class MediaListenerService : NotificationListenerService() {
                 if (pauseRegex.containsMatchIn(title)) return true
                 if (playRegex.containsMatchIn(title)) return false
             }
-
             val iconStr = action.getIcon()?.toString()?.lowercase() ?: ""
             if (iconStr.contains("pause")) return true
             if (iconStr.contains("play") && !iconStr.contains("playlist")) return false
