@@ -1,14 +1,12 @@
 package com.example.album_viewer
 
 import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.content.ComponentName
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -17,7 +15,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
-import android.media.AudioManager
+import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -27,11 +25,12 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
+import android.provider.MediaStore
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
 import android.util.LruCache
-import androidx.core.app.NotificationCompat
+import android.util.Size
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
@@ -47,15 +46,13 @@ class MediaListenerService : NotificationListenerService() {
 
     companion object {
         private const val TAG = "MediaListenerService"
-        private const val CHANNEL_ID = "album_viewer_foreground_channel"
-        private const val NOTIFICATION_ID = 9999
     }
 
     private var sessionManager: MediaSessionManager? = null
-    private var audioManager: AudioManager? = null
     private var monitorJob: Job? = null
     private var updateDebounceJob: Job? = null
     private var popupDismissJob: Job? = null
+    private var artworkRetryJob: Job? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val isUpdating = AtomicBoolean(false)
 
@@ -65,12 +62,12 @@ class MediaListenerService : NotificationListenerService() {
     private var currentTitle = ""
     private var currentArtist = ""
     private var currentPackage = ""
-    private var displayedTrackSignature = ""
+    private var lastSentTrackSignature = ""
     private var isShowingNotificationPopup = false
 
     private var lastRawArtwork: Bitmap? = null
 
-    // ★状態フラグ
+    // 停止後判定用（一時的なバッファリングや曲間スキップ時のチラつきを防ぐため2.5秒）
     private var stopDetectionTimestamp: Long = 0L
     private var isStandbyScreenActive = false
     private var lastSentMinute = -1
@@ -81,18 +78,9 @@ class MediaListenerService : NotificationListenerService() {
         triggerUpdateWithDebounce(250)
     }
 
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
-        startForegroundService()
-    }
-
     override fun onListenerConnected() {
         super.onListenerConnected()
-        startForegroundService()
-
         sessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val component = ComponentName(this, MediaListenerService::class.java)
         try {
             sessionManager?.addOnActiveSessionsChangedListener(sessionListener, component)
@@ -102,17 +90,16 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "Failed to register active sessions listener", e)
         }
 
-        // Bluetooth再接続時に自動再同期
         serviceScope.launch {
             BluetoothSppManager.connectionStatus.collect { status ->
                 if (status == ConnectionStatus.CONNECTED) {
-                    Log.d(TAG, "Bluetooth Connected -> Auto Resyncing...")
+                    Log.d(TAG, "Bluetooth Connected -> Resyncing...")
                     delay(800)
                     isStandbyScreenActive = false
-                    displayedTrackSignature = ""
                     currentTitle = ""
                     currentArtist = ""
                     currentPackage = ""
+                    lastSentTrackSignature = ""
                     lastSentMinute = -1
                     stopDetectionTimestamp = 0L
                     triggerUpdateDirect()
@@ -123,50 +110,12 @@ class MediaListenerService : NotificationListenerService() {
         startMonitoringLoop()
     }
 
-    private fun startForegroundService() {
-        try {
-            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("ESP32 Music Display")
-                .setContentText("ESP32と常時接続中（バックグラウンド同期有効）")
-                .setSmallIcon(R.mipmap.ic_launcher)
-                .setPriority(NotificationCompat.PRIORITY_MIN)
-                .setOngoing(true)
-                .build()
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not start foreground notification", e)
-        }
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "ESP32 Display Service",
-                NotificationManager.IMPORTANCE_MIN
-            ).apply {
-                description = "ESP32とのバックグラウンド同期を維持する常駐サービスです"
-                setShowBadge(false)
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-        }
-    }
-
     override fun onDestroy() {
         super.onDestroy()
         monitorJob?.cancel()
         updateDebounceJob?.cancel()
         popupDismissJob?.cancel()
+        artworkRetryJob?.cancel()
         unregisterAllCallbacks()
         sessionManager?.removeOnActiveSessionsChangedListener(sessionListener)
     }
@@ -250,7 +199,7 @@ class MediaListenerService : NotificationListenerService() {
                 targetSize = 240
             )
 
-            val jpegBytes = compressToBaselineJpeg(popupBitmap, quality = 65)
+            val jpegBytes = compressToSafeBaselineJpeg(popupBitmap)
             val displayTitle = "🔔 $appName: $title"
             val displayArtist = text
 
@@ -266,7 +215,7 @@ class MediaListenerService : NotificationListenerService() {
                 isShowingNotificationPopup = false
                 isStandbyScreenActive = false
                 stopDetectionTimestamp = 0L
-                displayedTrackSignature = ""
+                lastSentTrackSignature = ""
                 triggerUpdateDirect()
             }
         }
@@ -279,11 +228,11 @@ class MediaListenerService : NotificationListenerService() {
         for (controller in controllers) {
             val callback = object : MediaController.Callback() {
                 override fun onMetadataChanged(metadata: MediaMetadata?) {
-                    triggerUpdateWithDebounce(350)
+                    triggerUpdateWithDebounce(200)
                 }
 
                 override fun onPlaybackStateChanged(state: PlaybackState?) {
-                    triggerUpdateWithDebounce(200)
+                    triggerUpdateWithDebounce(150)
                 }
             }
             try {
@@ -336,29 +285,30 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
-    /**
-     * ★コア状態遷移エンジン（音楽再生 ↔ スタンバイ時計）
-     */
     private suspend fun updateActiveMedia() {
         if (isShowingNotificationPopup) return
         if (!isUpdating.compareAndSet(false, true)) return
 
         try {
             val trackInfo = detectCurrentActiveTrack()
+            val isMusicActuallyPlaying = (trackInfo != null && trackInfo.title.isNotBlank() && trackInfo.isPlaying)
 
-            if (trackInfo != null && trackInfo.isPlaying) {
+            if (isMusicActuallyPlaying && trackInfo != null) {
                 // ==========================================
                 // 🎵 1. 音楽再生中（PLAYING）
                 // ==========================================
                 stopDetectionTimestamp = 0L
+                isStandbyScreenActive = false
 
-                val trackSignature = "${trackInfo.packageName}_${trackInfo.title}_${trackInfo.artist}"
-                // ★超重要: スタンバイ画面が表示中だった場合、または新曲の場合は確実に送信！
-                val needSend = (isStandbyScreenActive || trackSignature != displayedTrackSignature)
+                // ★画像の有無と画像サイズもシグネチャに含める
+                val hasArt = (trackInfo.bitmap != null)
+                val artSignature = trackInfo.bitmap?.let { "${it.width}x${it.height}_${it.allocationByteCount}" } ?: "no_art"
+                val trackSignature = "${trackInfo.packageName}_${trackInfo.title}_${trackInfo.artist}_${hasArt}_$artSignature"
 
-                if (needSend) {
-                    isStandbyScreenActive = false
-                    displayedTrackSignature = trackSignature
+                val isNewTrackOrArtUpdated = (trackSignature != lastSentTrackSignature)
+
+                if (isNewTrackOrArtUpdated) {
+                    lastSentTrackSignature = trackSignature
                     currentTitle = trackInfo.title
                     currentArtist = trackInfo.artist
                     currentPackage = trackInfo.packageName
@@ -366,18 +316,25 @@ class MediaListenerService : NotificationListenerService() {
                     lastRawArtwork = trackInfo.bitmap
                     val rawBitmap = trackInfo.bitmap ?: generatePlaceholderArtwork(trackInfo.title, 240)
                     val squareBmp = processBitmapToStandardBaseline(rawBitmap, 240)
-                    val jpegBytes = compressToBaselineJpeg(squareBmp, quality = 65)
+                    
+                    // ESP32の24KBバッファを超えないセーフ圧縮
+                    val jpegBytes = compressToSafeBaselineJpeg(squareBmp)
 
                     withContext(Dispatchers.Main) {
                         MediaStateHolder.updateTrack(trackInfo.title, trackInfo.artist, trackInfo.album, trackInfo.packageName, squareBmp, jpegBytes)
                     }
 
                     BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes)
-                    Log.d(TAG, "Sent Music Art: [${trackInfo.packageName}] ${trackInfo.title}")
+                    Log.d(TAG, "Sent Track & Art: [${trackInfo.packageName}] ${trackInfo.title} (Art: $hasArt, Size: ${jpegBytes.size} bytes)")
+
+                    // 画像未取得時は遅延リトライを実行
+                    if (!hasArt) {
+                        scheduleArtworkRetry()
+                    }
                 }
             } else {
                 // ==========================================
-                // ⏸️ 2. 音楽停止中（一時停止 PAUSED または 曲なし）
+                // ⏸️ 2. 音楽停止中（一時停止または完全停止）
                 // ==========================================
                 val now = System.currentTimeMillis()
                 val cal = Calendar.getInstance()
@@ -386,10 +343,9 @@ class MediaListenerService : NotificationListenerService() {
 
                 if (stopDetectionTimestamp == 0L) {
                     stopDetectionTimestamp = now
-                } else if (!isStandbyScreenActive && (now - stopDetectionTimestamp >= 1500L)) {
-                    // ★一時停止から1.5秒経過！スタンバイ時計へ切り替え
+                } else if (!isStandbyScreenActive && (now - stopDetectionTimestamp >= 2500L)) {
                     isStandbyScreenActive = true
-                    displayedTrackSignature = "" // 再生再開時に即座にアルバムアートを再送できるようにクリア
+                    lastSentTrackSignature = ""
                     currentTitle = ""
                     currentArtist = ""
                     currentPackage = ""
@@ -397,9 +353,8 @@ class MediaListenerService : NotificationListenerService() {
                     lastSentBatteryPct = batteryPct
 
                     sendStandbyDashboard(cal, batteryPct, isCharging)
-                    Log.d(TAG, "Music Paused -> Switched to Standby Clock")
+                    Log.d(TAG, "Music Stopped/Paused -> Switched to Standby Clock")
                 } else if (isStandbyScreenActive) {
-                    // 待機画面中：1分ごとに時計画像を自動更新
                     if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5) {
                         lastSentMinute = currentMinute
                         lastSentBatteryPct = batteryPct
@@ -414,9 +369,19 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
+    private fun scheduleArtworkRetry() {
+        artworkRetryJob?.cancel()
+        artworkRetryJob = serviceScope.launch {
+            delay(600)
+            triggerUpdateDirect()
+            delay(1000)
+            triggerUpdateDirect()
+        }
+    }
+
     private suspend fun sendStandbyDashboard(cal: Calendar, batteryPct: Int, isCharging: Boolean) {
         val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240)
-        val jpegBytes = compressToBaselineJpeg(dashboardBmp, quality = 65)
+        val jpegBytes = compressToSafeBaselineJpeg(dashboardBmp)
 
         val title = "📱 SMART STANDBY"
         val artist = if (isCharging) "⚡ Charging $batteryPct% | Ready" else "🔋 Battery $batteryPct% | Ready"
@@ -441,9 +406,9 @@ class MediaListenerService : NotificationListenerService() {
 
     private fun detectCurrentActiveTrack(): TrackInfo? {
         val candidates = mutableListOf<TrackInfo>()
-        val isAudioActive = audioManager?.isMusicActive == true
+        val notifications = activeNotifications ?: emptyArray()
 
-        // 1. MediaSession
+        // 1. MediaSession コントローラの走査
         try {
             val component = ComponentName(this, MediaListenerService::class.java)
             val controllers = sessionManager?.getActiveSessions(component) ?: emptyList()
@@ -453,21 +418,27 @@ class MediaListenerService : NotificationListenerService() {
                 val state = c.playbackState
                 val pkg = c.packageName ?: "unknown"
 
-                // 再生判定の最適化
-                val stateVal = state?.state ?: PlaybackState.STATE_NONE
-                val isPlaying = when (stateVal) {
-                    PlaybackState.STATE_PLAYING, PlaybackState.STATE_BUFFERING -> true
-                    PlaybackState.STATE_PAUSED, PlaybackState.STATE_STOPPED, PlaybackState.STATE_ERROR -> false
-                    else -> isAudioActive // 不明時は実際の音声出力で判断
+                val matchingSbn = findBestMediaNotification(notifications, pkg)
+                val notifPlayingState = matchingSbn?.let { isNotificationShowingPauseButton(it.notification) }
+
+                val isPlaying = when {
+                    isPlaybackStateActive(state) -> true
+                    state?.state == PlaybackState.STATE_PAUSED || state?.state == PlaybackState.STATE_STOPPED -> false
+                    notifPlayingState != null -> notifPlayingState
+                    else -> false
                 }
 
-                val updateTime = state?.lastPositionUpdateTime ?: 0L
-                val title = extractTitle(metadata, null)
-                val artist = extractArtist(metadata, null)
+                val updateTime = state?.lastPositionUpdateTime ?: matchingSbn?.postTime ?: 0L
+                val title = extractTitle(metadata, matchingSbn?.notification?.extras)
+                val artist = extractArtist(metadata, matchingSbn?.notification?.extras)
                 val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
 
                 if (title.isNotBlank()) {
-                    val bitmap = extractArtworkFromMetadata(metadata) ?: getNotificationHighResArtFallback(title)
+                    val bitmap = extractArtworkFromMetadata(metadata)
+                        ?: matchingSbn?.let { extractArtworkFromNotification(it.notification.extras, it.notification) }
+                        ?: findLocalArtworkByMediaStore(title, artist)
+                        ?: getNotificationHighResArtFallback(title)
+
                     candidates.add(TrackInfo(title, artist, album, bitmap, pkg, isPlaying, updateTime))
                 }
             }
@@ -475,31 +446,32 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "MediaSession search error", e)
         }
 
-        // 2. 通知バー
-        val notifications = activeNotifications
-        if (notifications != null) {
-            for (sbn in notifications) {
-                val notif = sbn.notification ?: continue
-                val extras = notif.extras ?: continue
-                val isMedia = extras.containsKey(Notification.EXTRA_MEDIA_SESSION)
-                val pkg = sbn.packageName.lowercase()
+        // 2. 通知バーのメディア通知の探索
+        for (sbn in notifications) {
+            val notif = sbn.notification ?: continue
+            val extras = notif.extras ?: continue
+            val pkg = sbn.packageName.lowercase()
 
-                if (isMedia || pkg.contains("spotify") || pkg.contains("youtube") ||
-                    pkg.contains("music") || pkg.contains("audio") || pkg.contains("sound") || pkg.contains("radiko")) {
+            val isMedia = extras.containsKey(Notification.EXTRA_MEDIA_SESSION) ||
+                          notif.category == Notification.CATEGORY_TRANSPORT ||
+                          hasMediaActionButtons(notif) ||
+                          pkg.contains("spotify") || pkg.contains("youtube") || pkg.contains("music") ||
+                          pkg.contains("audio") || pkg.contains("sound") || pkg.contains("radiko") ||
+                          pkg.contains("podcast") || pkg.contains("player")
 
-                    val title = extractTitle(null, extras)
-                    val artist = extractArtist(null, extras)
-                    val album = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: ""
-                    val postTime = sbn.postTime
+            if (isMedia) {
+                val title = extractTitle(null, extras)
+                val artist = extractArtist(null, extras)
+                val album = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: ""
+                val postTime = sbn.postTime
 
-                    // 通知の再生ボタン判定
-                    val isPlaying = isNotificationPlaying(notif) ?: isAudioActive
+                val isPlaying = isNotificationShowingPauseButton(notif) ?: true
 
-                    if (title.isNotBlank()) {
-                        if (candidates.none { it.packageName.equals(pkg, ignoreCase = true) }) {
-                            val bitmap = extractArtworkFromNotification(extras, notif)
-                            candidates.add(TrackInfo(title, artist, album, bitmap, pkg, isPlaying, postTime))
-                        }
+                if (title.isNotBlank()) {
+                    if (candidates.none { it.packageName.equals(pkg, ignoreCase = true) }) {
+                        val bitmap = extractArtworkFromNotification(extras, notif)
+                            ?: findLocalArtworkByMediaStore(title, artist)
+                        candidates.add(TrackInfo(title, artist, album, bitmap, pkg, isPlaying, postTime))
                     }
                 }
             }
@@ -507,26 +479,133 @@ class MediaListenerService : NotificationListenerService() {
 
         if (candidates.isEmpty()) return null
 
-        // 再生中(isPlaying == true)を最優先でソート
         return candidates
             .sortedWith(compareByDescending<TrackInfo> { it.isPlaying }
                 .thenByDescending { it.lastUpdateTime })
             .firstOrNull()
     }
 
-    private fun isNotificationPlaying(notif: Notification?): Boolean? {
+    private fun findBestMediaNotification(notifications: Array<StatusBarNotification>, packageName: String): StatusBarNotification? {
+        val appNotifs = notifications.filter { it.packageName.equals(packageName, ignoreCase = true) }
+        if (appNotifs.isEmpty()) return null
+        return appNotifs.firstOrNull { 
+            it.notification.extras.containsKey(Notification.EXTRA_MEDIA_SESSION) ||
+            it.notification.category == Notification.CATEGORY_TRANSPORT ||
+            it.isOngoing
+        } ?: appNotifs.firstOrNull()
+    }
+
+    private fun isPlaybackStateActive(state: PlaybackState?): Boolean {
+        if (state == null) return false
+        return when (state.state) {
+            PlaybackState.STATE_PLAYING,
+            PlaybackState.STATE_FAST_FORWARDING,
+            PlaybackState.STATE_REWINDING,
+            PlaybackState.STATE_SKIPPING_TO_NEXT,
+            PlaybackState.STATE_SKIPPING_TO_PREVIOUS,
+            PlaybackState.STATE_BUFFERING,
+            PlaybackState.STATE_CONNECTING -> {
+                val speed = state.playbackSpeed
+                speed > 0f || speed == -1f
+            }
+            else -> false
+        }
+    }
+
+    private fun isNotificationShowingPauseButton(notif: Notification?): Boolean? {
         if (notif == null) return null
         val actions = notif.actions ?: return null
+
+        val pauseRegex = Regex("""^(pause|stop|一時停止|停止)$""", RegexOption.IGNORE_CASE)
+        val playRegex = Regex("""^(play|resume|再生|再開)$""", RegexOption.IGNORE_CASE)
+
+        for (action in actions) {
+            val title = action.title?.toString()?.trim() ?: ""
+            if (title.isNotEmpty()) {
+                if (pauseRegex.containsMatchIn(title)) return true
+                if (playRegex.containsMatchIn(title)) return false
+            }
+
+            val iconStr = action.getIcon()?.toString()?.lowercase() ?: ""
+            if (iconStr.contains("pause")) return true
+            if (iconStr.contains("play") && !iconStr.contains("playlist")) return false
+        }
+        return null
+    }
+
+    private fun hasMediaActionButtons(notif: Notification?): Boolean {
+        val actions = notif?.actions ?: return false
         for (action in actions) {
             val title = action.title?.toString()?.lowercase() ?: ""
-            if (title.contains("play") || title.contains("再生") || title.contains("resume") || title.contains("再開")) {
-                return false
-            }
-            if (title.contains("pause") || title.contains("一時停止") || title.contains("stop") || title.contains("停止")) {
+            val icon = action.getIcon()?.toString()?.lowercase() ?: ""
+            if (title.contains("pause") || title.contains("play") || title.contains("再生") ||
+                title.contains("next") || title.contains("prev") || icon.contains("media")) {
                 return true
             }
         }
-        return null
+        return false
+    }
+
+    private fun findLocalArtworkByMediaStore(title: String, artist: String): Bitmap? {
+        if (title.isBlank()) return null
+        return try {
+            val uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+            val projection = arrayOf(
+                MediaStore.Audio.Media._ID,
+                MediaStore.Audio.Media.ALBUM_ID,
+                MediaStore.Audio.Media.TITLE,
+                MediaStore.Audio.Media.ARTIST
+            )
+            val selection = "${MediaStore.Audio.Media.TITLE} LIKE ?"
+            val selectionArgs = arrayOf("%$title%")
+
+            contentResolver.query(uri, projection, selection, selectionArgs, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndex(MediaStore.Audio.Media._ID)
+                val albumIdCol = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM_ID)
+                val artistCol = cursor.getColumnIndex(MediaStore.Audio.Media.ARTIST)
+
+                while (cursor.moveToNext()) {
+                    val mediaId = cursor.getLong(idCol)
+                    val albumId = cursor.getLong(albumIdCol)
+                    val foundArtist = if (artistCol != -1) cursor.getString(artistCol) else ""
+
+                    if (artist.isNotBlank() && foundArtist.isNotBlank() &&
+                        !foundArtist.contains(artist, ignoreCase = true) &&
+                        !artist.contains(foundArtist, ignoreCase = true)
+                    ) {
+                        continue
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        try {
+                            val itemUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, mediaId)
+                            val thumb = contentResolver.loadThumbnail(itemUri, Size(240, 240), null)
+                            if (thumb != null) return thumb
+                        } catch (e: Exception) {
+                            // ignore
+                        }
+                    }
+
+                    if (albumId > 0) {
+                        try {
+                            val albumArtUri = ContentUris.withAppendedId(
+                                Uri.parse("content://media/external/audio/albumart"),
+                                albumId
+                            )
+                            contentResolver.openInputStream(albumArtUri)?.use { inputStream ->
+                                val bmp = BitmapFactory.decodeStream(inputStream)
+                                if (bmp != null) return bmp
+                            }
+                        } catch (e: Exception) {
+                            // ignore
+                        }
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun extractTitle(metadata: MediaMetadata?, extras: Bundle?): String {
@@ -575,20 +654,51 @@ class MediaListenerService : NotificationListenerService() {
         return null
     }
 
-    private fun extractArtworkFromNotification(extras: Bundle, notif: Notification): Bitmap? {
-        if (extras.containsKey(Notification.EXTRA_PICTURE)) {
-            val pic = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                extras.getParcelable(Notification.EXTRA_PICTURE, Bitmap::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                extras.getParcelable<Parcelable>(Notification.EXTRA_PICTURE) as? Bitmap
+    private fun extractArtworkFromNotification(extras: Bundle?, notif: Notification?): Bitmap? {
+        if (extras != null) {
+            if (extras.containsKey(Notification.EXTRA_PICTURE)) {
+                val pic = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    extras.getParcelable(Notification.EXTRA_PICTURE, Bitmap::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    extras.getParcelable<Parcelable>(Notification.EXTRA_PICTURE) as? Bitmap
+                }
+                if (pic != null) return pic
             }
-            if (pic != null) return pic
+
+            if (extras.containsKey(Notification.EXTRA_LARGE_ICON_BIG)) {
+                val bigIcon = extras.get(Notification.EXTRA_LARGE_ICON_BIG)
+                when (bigIcon) {
+                    is Bitmap -> return bigIcon
+                    is Icon -> {
+                        try {
+                            bigIcon.loadDrawable(this)?.toBitmap()?.let { return it }
+                        } catch (e: Exception) {}
+                    }
+                }
+            }
+
+            if (extras.containsKey(Notification.EXTRA_LARGE_ICON)) {
+                val largeIcon = extras.get(Notification.EXTRA_LARGE_ICON)
+                when (largeIcon) {
+                    is Bitmap -> return largeIcon
+                    is Icon -> {
+                        try {
+                            largeIcon.loadDrawable(this)?.toBitmap()?.let { return it }
+                        } catch (e: Exception) {}
+                    }
+                }
+            }
         }
 
-        notif.getLargeIcon()?.let { icon ->
-            icon.loadDrawable(this)?.toBitmap()?.let { return it }
+        notif?.getLargeIcon()?.let { icon ->
+            try {
+                icon.loadDrawable(this)?.toBitmap()?.let { return it }
+            } catch (e: Exception) {}
         }
+
+        @Suppress("DEPRECATION")
+        notif?.largeIcon?.let { return it }
 
         return null
     }
@@ -607,23 +717,32 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     private fun fetchBitmapFromUri(uriStr: String): Bitmap? {
+        if (uriStr.isBlank()) return null
         return try {
             val uri = Uri.parse(uriStr)
-            if (uri.scheme == "http" || uri.scheme == "https") {
-                val url = URL(uriStr)
-                val conn = url.openConnection() as HttpURLConnection
-                conn.connectTimeout = 3000
-                conn.readTimeout = 3000
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0")
-                conn.instanceFollowRedirects = true
-                conn.doInput = true
-                conn.connect()
-                conn.inputStream.use { inputStream ->
-                    BitmapFactory.decodeStream(inputStream)
+            when (uri.scheme?.lowercase()) {
+                "http", "https" -> {
+                    val url = URL(uriStr)
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.connectTimeout = 3000
+                    conn.readTimeout = 3000
+                    conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                    conn.instanceFollowRedirects = true
+                    conn.doInput = true
+                    conn.connect()
+                    conn.inputStream.use { inputStream ->
+                        BitmapFactory.decodeStream(inputStream)
+                    }
                 }
-            } else {
-                contentResolver.openInputStream(uri)?.use { inputStream ->
-                    BitmapFactory.decodeStream(inputStream)
+                "content", "file", "android.resource" -> {
+                    contentResolver.openInputStream(uri)?.use { inputStream ->
+                        BitmapFactory.decodeStream(inputStream)
+                    }
+                }
+                else -> {
+                    if (uriStr.startsWith("/")) {
+                        BitmapFactory.decodeFile(uriStr)
+                    } else null
                 }
             }
         } catch (e: Exception) {
@@ -858,9 +977,18 @@ class MediaListenerService : NotificationListenerService() {
         return bmp
     }
 
-    private fun compressToBaselineJpeg(bitmap: Bitmap, quality: Int = 65): ByteArray {
-        val stream = ByteArrayOutputStream()
+    private fun compressToSafeBaselineJpeg(bitmap: Bitmap): ByteArray {
+        var quality = 65
+        var stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
-        return stream.toByteArray()
+        var bytes = stream.toByteArray()
+
+        while (bytes.size > 20480 && quality > 25) {
+            quality -= 10
+            stream = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
+            bytes = stream.toByteArray()
+        }
+        return bytes
     }
 }
