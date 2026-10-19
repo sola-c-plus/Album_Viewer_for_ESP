@@ -11,9 +11,11 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Icon
 import android.media.MediaMetadata
@@ -190,7 +192,7 @@ class MediaListenerService : NotificationListenerService() {
             val displayTitle = "🔔 $appName: $title"
             val displayArtist = text
             val rgb565Color = colorToRgb565(accentColor)
-            val rgb565Bg = 0x0000 // 通知時は黒背景
+            val rgb565Bg = 0x0000
 
             withContext(Dispatchers.Main) {
                 MediaStateHolder.updateTrack(displayTitle, displayArtist, "", pkg, popupBitmap, jpegBytes)
@@ -298,18 +300,20 @@ class MediaListenerService : NotificationListenerService() {
 
                     lastRawArtwork = trackInfo.bitmap
                     val rawBitmap = trackInfo.bitmap ?: generatePlaceholderArtwork(trackInfo.title, 240)
-                    val squareBmp = processBitmapToStandardBaseline(rawBitmap, 240)
-                    val jpegBytes = compressToSafeBaselineJpeg(squareBmp)
 
-                    // ★画像から「アクセントカラー」と「文字裏の背景色」を自動抽出
-                    val (rgb565Accent, rgb565Bg) = extractOptimalPalette(squareBmp)
+                    // ★パレット（アクセント色・背景色）を抽出
+                    val (rgb565Accent, rgb565Bg, fullBgColor) = extractOptimalPaletteWithFullColor(rawBitmap)
+
+                    // ★背景色へふんわり溶け込む半透明グラデーションを画像に焼き込む
+                    val squareBmp = processBitmapWithBottomFade(rawBitmap, fullBgColor, 240)
+                    val jpegBytes = compressToSafeBaselineJpeg(squareBmp)
 
                     withContext(Dispatchers.Main) {
                         MediaStateHolder.updateTrack(trackInfo.title, trackInfo.artist, trackInfo.album, trackInfo.packageName, squareBmp, jpegBytes)
                     }
 
                     BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes, rgb565Accent, rgb565Bg)
-                    Log.d(TAG, "Sent Track & Art & Colors(Accent: 0x${Integer.toHexString(rgb565Accent)}, Bg: 0x${Integer.toHexString(rgb565Bg)}): ${trackInfo.title}")
+                    Log.d(TAG, "Sent Track with Smooth Fade: ${trackInfo.title}")
 
                     if (!hasArt) {
                         scheduleArtworkRetry()
@@ -374,10 +378,9 @@ class MediaListenerService : NotificationListenerService() {
         BluetoothSppManager.sendMediaPacket(title, artist, "", jpegBytes, defaultCyanRgb565, blackBgRgb565)
     }
 
-    /**
-     * ★画像から「アクセントカラー」と「文字裏の背景色」のペアを抽出
-     */
-    private fun extractOptimalPalette(bitmap: Bitmap): Pair<Int, Int> {
+    private data class PaletteResult(val accentRgb565: Int, val bgRgb565: Int, val fullBgColor: Int)
+
+    private fun extractOptimalPaletteWithFullColor(bitmap: Bitmap): PaletteResult {
         return try {
             val scaled = Bitmap.createScaledBitmap(bitmap, 24, 24, false)
             val pixels = IntArray(24 * 24)
@@ -401,21 +404,22 @@ class MediaListenerService : NotificationListenerService() {
                 }
             }
 
-            // 1. アクセントカラー（明度0.85、彩度0.45以上にブーストしてくっきり発色）
+            // 1. アクセントカラー
             Color.colorToHSV(bestColor, hsv)
             if (hsv[2] < 0.85f) hsv[2] = 0.85f
             if (hsv[1] < 0.45f) hsv[1] = 0.45f
             val accentRgb565 = colorToRgb565(Color.HSVToColor(hsv))
 
-            // 2. 文字裏の背景色（同系統の色相で、明度0.12の極暗色＝ディープトーン）
-            // これにより文字の白(TFT_WHITE)が完璧に読め、かつジャケットと一体化する
-            hsv[1] = (hsv[1] * 0.8f).coerceIn(0.35f, 0.65f) // 彩度を適度に残す
-            hsv[2] = 0.12f // 12%の明るさ（真っ黒に近いがほんのり上品に色がつく）
-            val bgRgb565 = colorToRgb565(Color.HSVToColor(hsv))
+            // 2. 文字裏のディープトーン背景色
+            hsv[1] = (hsv[1] * 0.8f).coerceIn(0.35f, 0.65f)
+            hsv[2] = 0.12f
+            val fullBgColor = Color.HSVToColor(hsv)
+            val bgRgb565 = colorToRgb565(fullBgColor)
 
-            Pair(accentRgb565, bgRgb565)
+            PaletteResult(accentRgb565, bgRgb565, fullBgColor)
         } catch (e: Exception) {
-            Pair(colorToRgb565(Color.rgb(0, 210, 255)), 0x0000)
+            val defCyan = Color.rgb(0, 210, 255)
+            PaletteResult(colorToRgb565(defCyan), 0x0000, Color.BLACK)
         }
     }
 
@@ -424,6 +428,49 @@ class MediaListenerService : NotificationListenerService() {
         val g = (Color.green(colorInt) shr 2) and 0x3F
         val b = (Color.blue(colorInt) shr 3) and 0x1F
         return (r shl 11) or (g shl 5) or b
+    }
+
+    /**
+     * ★下部を自然な半透明フェード（背景色へ溶け込ませる）で加工する処理
+     */
+    private fun processBitmapWithBottomFade(source: Bitmap, fadeToColor: Int, targetSize: Int = 240): Bitmap {
+        val minEdge = minOf(source.width, source.height)
+        val cropX = (source.width - minEdge) / 2
+        val cropY = (source.height - minEdge) / 2
+
+        val cropped = Bitmap.createBitmap(source, cropX, cropY, minEdge, minEdge)
+        val scaled = Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
+
+        val result = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
+        val canvas = Canvas(result)
+        canvas.drawColor(fadeToColor)
+
+        // アルバムアート本体を描画
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        canvas.drawBitmap(scaled, 0f, 0f, paint)
+
+        // ★ Y=145 から Y=182 にかけて、背景色へ向かう滑らかなグラデーションを焼き込む
+        val fadeStart = 145f
+        val fadeEnd = 182f
+        val gradientShader = LinearGradient(
+            0f, fadeStart, 0f, fadeEnd,
+            Color.TRANSPARENT,
+            fadeToColor,
+            Shader.TileMode.CLAMP
+        )
+        val gradPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = gradientShader
+        }
+        canvas.drawRect(0f, fadeStart, targetSize.toFloat(), fadeEnd, gradPaint)
+
+        // Y=182 以降（文字ドックの真下）は完全に背景色で均一にする
+        val bottomSolidPaint = Paint().apply {
+            color = fadeToColor
+            style = Paint.Style.FILL
+        }
+        canvas.drawRect(0f, fadeEnd, targetSize.toFloat(), targetSize.toFloat(), bottomSolidPaint)
+
+        return result
     }
 
     data class TrackInfo(
@@ -966,22 +1013,6 @@ class MediaListenerService : NotificationListenerService() {
         } catch (e: Exception) {
             null
         }
-    }
-
-    private fun processBitmapToStandardBaseline(source: Bitmap, targetSize: Int = 240): Bitmap {
-        val minEdge = minOf(source.width, source.height)
-        val cropX = (source.width - minEdge) / 2
-        val cropY = (source.height - minEdge) / 2
-
-        val cropped = Bitmap.createBitmap(source, cropX, cropY, minEdge, minEdge)
-        val scaled = Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
-
-        val result = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
-        val canvas = Canvas(result)
-        canvas.drawColor(Color.BLACK)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        canvas.drawBitmap(scaled, 0f, 0f, paint)
-        return result
     }
 
     private fun generatePlaceholderArtwork(title: String, size: Int = 240): Bitmap {
