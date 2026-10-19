@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -36,9 +37,15 @@ object BluetoothSppManager {
 
     private var socket: BluetoothSocket? = null
     private var outputStream: OutputStream? = null
+    private var inputStream: InputStream? = null
+    private var receiveJob: Job? = null
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
     private val sendMutex = Mutex()
+
+    // ESP32からのボタンコマンドコールバック (0x01: Play/Pause, 0x02: Next, 0x03: Prev)
+    var onCommandReceived: ((Byte) -> Unit)? = null
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
@@ -53,8 +60,11 @@ object BluetoothSppManager {
                 s.connect()
                 socket = s
                 outputStream = s.outputStream
+                inputStream = s.inputStream
                 _connectionStatus.value = ConnectionStatus.CONNECTED
                 Log.d(TAG, "Bluetooth connected: ${device.name}")
+
+                startReceiveLoop()
             } catch (e: Exception) {
                 Log.e(TAG, "Bluetooth connection failed", e)
                 _connectionStatus.value = ConnectionStatus.ERROR
@@ -64,16 +74,106 @@ object BluetoothSppManager {
     }
 
     fun disconnect() {
+        receiveJob?.cancel()
+        receiveJob = null
+        try {
+            inputStream?.close()
+        } catch (e: Exception) {
+            // ignore
+        }
         try {
             outputStream?.close()
+        } catch (e: Exception) {
+            // ignore
+        }
+        try {
             socket?.close()
         } catch (e: Exception) {
             // ignore
         } finally {
             socket = null
             outputStream = null
+            inputStream = null
             _connectionStatus.value = ConnectionStatus.DISCONNECTED
             _connectedDeviceName.value = null
+        }
+    }
+
+    private fun startReceiveLoop() {
+        receiveJob?.cancel()
+        receiveJob = scope.launch {
+            val stream = inputStream ?: return@launch
+            var state = 0 // 0: WAIT_AA, 1: WAIT_55, 2: WAIT_TYPE, 3: WAIT_LEN, 4: READ_PAYLOAD
+            var packetType: Byte = 0
+            var packetLen = 0
+            var lenBytesRead = 0
+            val lenBuf = ByteArray(4)
+            var payload = ByteArray(0)
+            var payloadIndex = 0
+
+            try {
+                while (isActive) {
+                    val b = stream.read()
+                    if (b == -1) break
+
+                    when (state) {
+                        0 -> {
+                            if (b == 0xAA) state = 1
+                        }
+                        1 -> {
+                            if (b == 0x55) {
+                                state = 2
+                            } else if (b != 0xAA) {
+                                state = 0
+                            }
+                        }
+                        2 -> {
+                            packetType = b.toByte()
+                            lenBytesRead = 0
+                            packetLen = 0
+                            state = 3
+                        }
+                        3 -> {
+                            lenBuf[lenBytesRead++] = b.toByte()
+                            if (lenBytesRead == 4) {
+                                packetLen = ((lenBuf[0].toInt() and 0xFF) shl 24) or
+                                            ((lenBuf[1].toInt() and 0xFF) shl 16) or
+                                            ((lenBuf[2].toInt() and 0xFF) shl 8) or
+                                            (lenBuf[3].toInt() and 0xFF)
+                                if (packetLen in 1..256) {
+                                    payload = ByteArray(packetLen)
+                                    payloadIndex = 0
+                                    state = 4
+                                } else if (packetLen == 0) {
+                                    handleReceivedPacket(packetType, ByteArray(0))
+                                    state = 0
+                                } else {
+                                    state = 0
+                                }
+                            }
+                        }
+                        4 -> {
+                            payload[payloadIndex++] = b.toByte()
+                            if (payloadIndex >= packetLen) {
+                                handleReceivedPacket(packetType, payload)
+                                state = 0
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                if (isActive) {
+                    Log.d(TAG, "SPP Receive loop ended: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun handleReceivedPacket(type: Byte, payload: ByteArray) {
+        if (type == 0x04.toByte() && payload.isNotEmpty()) {
+            val cmd = payload[0]
+            Log.d(TAG, "Media Control Command Received: 0x%02X".format(cmd))
+            onCommandReceived?.invoke(cmd)
         }
     }
 

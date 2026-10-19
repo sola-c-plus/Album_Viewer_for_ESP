@@ -18,6 +18,7 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Icon
+import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -33,6 +34,7 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 import android.util.LruCache
 import android.util.Size
+import android.view.KeyEvent
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
@@ -91,6 +93,11 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "Failed to register active sessions listener", e)
         }
 
+        // ESP32からの物理ボタン入力を受信
+        BluetoothSppManager.onCommandReceived = { cmd ->
+            handleMediaCommand(cmd)
+        }
+
         serviceScope.launch {
             BluetoothSppManager.connectionStatus.collect { status ->
                 if (status == ConnectionStatus.CONNECTED) {
@@ -112,12 +119,59 @@ class MediaListenerService : NotificationListenerService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        BluetoothSppManager.onCommandReceived = null
         monitorJob?.cancel()
         updateDebounceJob?.cancel()
         popupDismissJob?.cancel()
         artworkRetryJob?.cancel()
         unregisterAllCallbacks()
         sessionManager?.removeOnActiveSessionsChangedListener(sessionListener)
+    }
+
+    private fun handleMediaCommand(cmd: Byte) {
+        serviceScope.launch {
+            try {
+                val component = ComponentName(this@MediaListenerService, MediaListenerService::class.java)
+                val controllers = sessionManager?.getActiveSessions(component) ?: emptyList()
+
+                val targetController = controllers.firstOrNull { isPlaybackStateActive(it.playbackState) }
+                    ?: controllers.firstOrNull { it.packageName == currentPackage }
+                    ?: controllers.firstOrNull()
+
+                if (targetController != null) {
+                    val controls = targetController.transportControls
+                    when (cmd.toInt()) {
+                        0x01 -> { // PLAY_PAUSE
+                            val state = targetController.playbackState?.state
+                            if (state == PlaybackState.STATE_PLAYING) {
+                                controls.pause()
+                            } else {
+                                controls.play()
+                            }
+                        }
+                        0x02 -> controls.skipToNext() // NEXT
+                        0x03 -> controls.skipToPrevious() // PREV
+                    }
+                    Log.d(TAG, "Executed command 0x%02X on %s".format(cmd, targetController.packageName))
+                } else {
+                    val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                    val keyCode = when (cmd.toInt()) {
+                        0x01 -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                        0x02 -> KeyEvent.KEYCODE_MEDIA_NEXT
+                        0x03 -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                        else -> 0
+                    }
+                    if (keyCode != 0 && audioManager != null) {
+                        audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+                        audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+                        Log.d(TAG, "Dispatched fallback KeyEvent: $keyCode")
+                    }
+                }
+                triggerUpdateWithDebounce(100)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error handling media command: $cmd", e)
+            }
+        }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -303,7 +357,6 @@ class MediaListenerService : NotificationListenerService() {
 
                     val (rgb565Accent, rgb565Bg, fullBgColor) = extractOptimalPaletteWithFullColor(rawBitmap)
 
-                    // ★フェード位置を下げた画像処理
                     val squareBmp = processBitmapWithBottomFade(rawBitmap, fullBgColor, 240)
                     val jpegBytes = compressToSafeBaselineJpeg(squareBmp)
 
@@ -427,9 +480,6 @@ class MediaListenerService : NotificationListenerService() {
         return (r shl 11) or (g shl 5) or b
     }
 
-    /**
-     * ★ Y=165〜194 にかけて下部グラデーションを焼き込み（イラスト表示エリアを拡大）
-     */
     private fun processBitmapWithBottomFade(source: Bitmap, fadeToColor: Int, targetSize: Int = 240): Bitmap {
         val minEdge = minOf(source.width, source.height)
         val cropX = (source.width - minEdge) / 2
@@ -445,7 +495,6 @@ class MediaListenerService : NotificationListenerService() {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         canvas.drawBitmap(scaled, 0f, 0f, paint)
 
-        // ★ Y=165 から Y=194 にかけて背景色へ向かうグラデーション
         val fadeStart = 165f
         val fadeEnd = 194f
         val gradientShader = LinearGradient(
@@ -459,7 +508,6 @@ class MediaListenerService : NotificationListenerService() {
         }
         canvas.drawRect(0f, fadeStart, targetSize.toFloat(), fadeEnd, gradPaint)
 
-        // Y=194 以降（新ドック開始位置より下）を背景色で均一化
         val bottomSolidPaint = Paint().apply {
             color = fadeToColor
             style = Paint.Style.FILL
