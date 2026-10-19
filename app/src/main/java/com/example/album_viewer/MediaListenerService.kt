@@ -301,10 +301,9 @@ class MediaListenerService : NotificationListenerService() {
                     lastRawArtwork = trackInfo.bitmap
                     val rawBitmap = trackInfo.bitmap ?: generatePlaceholderArtwork(trackInfo.title, 240)
 
-                    // ★パレット（アクセント色・背景色）を抽出
                     val (rgb565Accent, rgb565Bg, fullBgColor) = extractOptimalPaletteWithFullColor(rawBitmap)
 
-                    // ★背景色へふんわり溶け込む半透明グラデーションを画像に焼き込む
+                    // ★フェード位置を下げた画像処理
                     val squareBmp = processBitmapWithBottomFade(rawBitmap, fullBgColor, 240)
                     val jpegBytes = compressToSafeBaselineJpeg(squareBmp)
 
@@ -313,7 +312,7 @@ class MediaListenerService : NotificationListenerService() {
                     }
 
                     BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes, rgb565Accent, rgb565Bg)
-                    Log.d(TAG, "Sent Track with Smooth Fade: ${trackInfo.title}")
+                    Log.d(TAG, "Sent Track with Lower Dock Fade: ${trackInfo.title}")
 
                     if (!hasArt) {
                         scheduleArtworkRetry()
@@ -404,13 +403,11 @@ class MediaListenerService : NotificationListenerService() {
                 }
             }
 
-            // 1. アクセントカラー
             Color.colorToHSV(bestColor, hsv)
             if (hsv[2] < 0.85f) hsv[2] = 0.85f
             if (hsv[1] < 0.45f) hsv[1] = 0.45f
             val accentRgb565 = colorToRgb565(Color.HSVToColor(hsv))
 
-            // 2. 文字裏のディープトーン背景色
             hsv[1] = (hsv[1] * 0.8f).coerceIn(0.35f, 0.65f)
             hsv[2] = 0.12f
             val fullBgColor = Color.HSVToColor(hsv)
@@ -431,7 +428,7 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     /**
-     * ★下部を自然な半透明フェード（背景色へ溶け込ませる）で加工する処理
+     * ★ Y=165〜194 にかけて下部グラデーションを焼き込み（イラスト表示エリアを拡大）
      */
     private fun processBitmapWithBottomFade(source: Bitmap, fadeToColor: Int, targetSize: Int = 240): Bitmap {
         val minEdge = minOf(source.width, source.height)
@@ -445,13 +442,12 @@ class MediaListenerService : NotificationListenerService() {
         val canvas = Canvas(result)
         canvas.drawColor(fadeToColor)
 
-        // アルバムアート本体を描画
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         canvas.drawBitmap(scaled, 0f, 0f, paint)
 
-        // ★ Y=145 から Y=182 にかけて、背景色へ向かう滑らかなグラデーションを焼き込む
-        val fadeStart = 145f
-        val fadeEnd = 182f
+        // ★ Y=165 から Y=194 にかけて背景色へ向かうグラデーション
+        val fadeStart = 165f
+        val fadeEnd = 194f
         val gradientShader = LinearGradient(
             0f, fadeStart, 0f, fadeEnd,
             Color.TRANSPARENT,
@@ -463,7 +459,7 @@ class MediaListenerService : NotificationListenerService() {
         }
         canvas.drawRect(0f, fadeStart, targetSize.toFloat(), fadeEnd, gradPaint)
 
-        // Y=182 以降（文字ドックの真下）は完全に背景色で均一にする
+        // Y=194 以降（新ドック開始位置より下）を背景色で均一化
         val bottomSolidPaint = Paint().apply {
             color = fadeToColor
             style = Paint.Style.FILL
