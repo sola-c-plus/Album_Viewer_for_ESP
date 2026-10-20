@@ -1,15 +1,12 @@
 package com.example.album_viewer
 
 import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -38,7 +35,6 @@ import android.util.Log
 import android.util.LruCache
 import android.util.Size
 import android.view.KeyEvent
-import androidx.core.app.NotificationCompat
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
@@ -54,8 +50,6 @@ class MediaListenerService : NotificationListenerService() {
 
     companion object {
         private const val TAG = "MediaListenerService"
-        private const val NOTIFICATION_ID = 9001
-        private const val CHANNEL_ID = "esp32_display_foreground_channel"
     }
 
     private var sessionManager: MediaSessionManager? = null
@@ -89,11 +83,6 @@ class MediaListenerService : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
-        BluetoothSppManager.init(applicationContext)
-
-        // フォアグラウンド常駐通知を開始（スリープキラー防止）
-        startKeepAliveForegroundNotification("ESP32 Display 接続準備完了")
-
         sessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
         val component = ComponentName(this, MediaListenerService::class.java)
         try {
@@ -104,69 +93,28 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "Failed to register active sessions listener", e)
         }
 
+        // ESP32からの物理ボタン入力を受信
         BluetoothSppManager.onCommandReceived = { cmd ->
             handleMediaCommand(cmd)
         }
 
         serviceScope.launch {
             BluetoothSppManager.connectionStatus.collect { status ->
-                when (status) {
-                    ConnectionStatus.CONNECTED -> {
-                        startKeepAliveForegroundNotification("ESP32 接続中 (${BluetoothSppManager.connectedDeviceName.value ?: ""})")
-                        delay(800)
-                        isStandbyScreenActive = false
-                        currentTitle = ""
-                        currentArtist = ""
-                        currentPackage = ""
-                        lastSentTrackSignature = ""
-                        lastSentMinute = -1
-                        stopDetectionTimestamp = 0L
-                        triggerUpdateDirect()
-                    }
-                    ConnectionStatus.CONNECTING -> {
-                        startKeepAliveForegroundNotification("ESP32 再接続を試行中...")
-                    }
-                    ConnectionStatus.DISCONNECTED, ConnectionStatus.ERROR -> {
-                        startKeepAliveForegroundNotification("ESP32 未接続 (バックグラウンド待機中)")
-                    }
+                if (status == ConnectionStatus.CONNECTED) {
+                    delay(800)
+                    isStandbyScreenActive = false
+                    currentTitle = ""
+                    currentArtist = ""
+                    currentPackage = ""
+                    lastSentTrackSignature = ""
+                    lastSentMinute = -1
+                    stopDetectionTimestamp = 0L
+                    triggerUpdateDirect()
                 }
             }
         }
 
         startMonitoringLoop()
-    }
-
-    private fun startKeepAliveForegroundNotification(statusText: String) {
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "ESP32 Display Keep-Alive",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "ESP32との常時Bluetooth接続を維持します"
-                setShowBadge(false)
-            }
-            notificationManager.createNotificationChannel(channel)
-        }
-
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("ESP32 Music Display")
-            .setContentText(statusText)
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start foreground service", e)
-        }
     }
 
     override fun onDestroy() {
@@ -193,7 +141,7 @@ class MediaListenerService : NotificationListenerService() {
                 if (targetController != null) {
                     val controls = targetController.transportControls
                     when (cmd.toInt()) {
-                        0x01 -> {
+                        0x01 -> { // PLAY_PAUSE
                             val state = targetController.playbackState?.state
                             if (state == PlaybackState.STATE_PLAYING) {
                                 controls.pause()
@@ -201,8 +149,8 @@ class MediaListenerService : NotificationListenerService() {
                                 controls.play()
                             }
                         }
-                        0x02 -> controls.skipToNext()
-                        0x03 -> controls.skipToPrevious()
+                        0x02 -> controls.skipToNext() // NEXT
+                        0x03 -> controls.skipToPrevious() // PREV
                     }
                     Log.d(TAG, "Executed command 0x%02X on %s".format(cmd, targetController.packageName))
                 } else {
@@ -417,7 +365,7 @@ class MediaListenerService : NotificationListenerService() {
                     }
 
                     BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes, rgb565Accent, rgb565Bg)
-                    Log.d(TAG, "Sent Track with Lower Dock Fade: ${trackInfo.title}")
+                    Log.d(TAG, "Sent Track with Smart Focus 1:1 Art: ${trackInfo.title}")
 
                     if (!hasArt) {
                         scheduleArtworkRetry()
@@ -532,13 +480,114 @@ class MediaListenerService : NotificationListenerService() {
         return (r shl 11) or (g shl 5) or b
     }
 
-    private fun processBitmapWithBottomFade(source: Bitmap, fadeToColor: Int, targetSize: Int = 240): Bitmap {
-        val minEdge = minOf(source.width, source.height)
-        val cropX = (source.width - minEdge) / 2
-        val cropY = (source.height - minEdge) / 2
+    /**
+     * 【高精度スマートフォーカス ＆ 上側オフセット】
+     * 文字・テロップ・UIノイズを除外し、キャラクターや顔・主役にカメラを合わせ、上寄り（Y=0基準）で1:1切り抜く
+     */
+    private fun cropSmartFocusSquare(source: Bitmap): Bitmap {
+        val width = source.width
+        val height = source.height
 
-        val cropped = Bitmap.createBitmap(source, cropX, cropY, minEdge, minEdge)
-        val scaled = Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
+        // 既に正方形、あるいは縦長の場合は上寄りで切り抜く
+        if (width <= height) {
+            val cropSize = width
+            return Bitmap.createBitmap(source, 0, 0, cropSize, cropSize)
+        }
+
+        // --- 横長画像（16:9等）の高精度解析 ---
+        val sampleW = 64
+        val sampleH = 36
+        val sampleBmp = Bitmap.createScaledBitmap(source, sampleW, sampleH, false)
+        val pixels = IntArray(sampleW * sampleH)
+        sampleBmp.getPixels(pixels, 0, sampleW, 0, 0, sampleW, sampleH)
+
+        val hsv = FloatArray(3)
+        val colEnergy = FloatArray(sampleW)
+
+        for (x in 0 until sampleW) {
+            var energySum = 0f
+            val normX = x.toFloat() / sampleW
+            // 画面の最端（左右6%）にあるチャンネルアイコンやロゴ帯を抑制
+            val isExtremeEdgeX = normX < 0.06f || normX > 0.94f
+
+            for (y in 0 until sampleH) {
+                val idx = y * sampleW + x
+                val c = pixels[idx]
+                Color.colorToHSV(c, hsv)
+                val h = hsv[0]
+                val s = hsv[1]
+                val v = hsv[2]
+
+                // 1. 肌色・顔・暖色ボーナス (イラスト・実写共通: 人物やキャラクターの主役領域)
+                val isWarmOrSkin = (h in 5f..50f || h in 320f..360f) && (s in 0.12f..0.75f) && (v in 0.35f..0.98f)
+                val skinBonus = if (isWarmOrSkin) 2.4f else 1.0f
+
+                // 2. 文字・ロゴ・テロップ抑制（高彩度でない純白や暗黒、字幕の白文字）
+                val isTextOrUi = (s < 0.10f && (v > 0.88f || v < 0.15f))
+                val textPenalty = if (isTextOrUi) 0.25f else 1.0f
+
+                // 3. エッジ検出（文字の急激すぎる白黒差は上限0.6で頭打ちにして文字勝ちを防ぐ）
+                var edge = 0f
+                if (x < sampleW - 1) {
+                    val rightC = pixels[idx + 1]
+                    val rDiff = Math.abs(Color.red(c) - Color.red(rightC))
+                    val gDiff = Math.abs(Color.green(c) - Color.green(rightC))
+                    val bDiff = Math.abs(Color.blue(c) - Color.blue(rightC))
+                    edge = ((rDiff + gDiff + bDiff) / 765f).coerceAtMost(0.6f)
+                }
+
+                // 下部30%（シークバー・動画時間マーク・字幕）は評価を下げる
+                val yWeight = if (y > sampleH * 0.7f) 0.4f else 1.0f
+
+                var pEnergy = (edge * 0.35f + s * 0.45f + v * 0.2f) * skinBonus * textPenalty * yWeight
+                if (isExtremeEdgeX) pEnergy *= 0.2f
+
+                energySum += pEnergy
+            }
+
+            // 構図バイアス: 中央〜三分割エリア(0.33, 0.66)を自然に優先
+            val distCenter = Math.abs(normX - 0.5f)
+            val compBias = 1.0f - distCenter * 0.35f
+            colEnergy[x] = energySum * compBias
+        }
+
+        // クロップ正方形サイズ: 高さいっぱいではなく、約88%にして少しズーム＆上寄せ
+        // これにより下部の不要な余白・テロップがカットされ、顔が画面上部〜中央の特等席に来る
+        val cropSize = (height * 0.88f).toInt()
+        val windowW = (sampleH * 0.88f).toInt()
+
+        var maxEnergy = -1f
+        var bestStartX = 0
+
+        for (x in 0..(sampleW - windowW)) {
+            var currentWindowEnergy = 0f
+            for (w in 0 until windowW) {
+                currentWindowEnergy += colEnergy[x + w]
+            }
+            if (currentWindowEnergy > maxEnergy) {
+                maxEnergy = currentWindowEnergy
+                bestStartX = x
+            }
+        }
+
+        val scale = width.toFloat() / sampleW.toFloat()
+        var actualCropX = (bestStartX * scale).toInt()
+        val maxCropX = width - cropSize
+        if (actualCropX < 0) actualCropX = 0
+        if (actualCropX > maxCropX) actualCropX = maxCropX
+
+        // ★ 上側オフセット:
+        // キャラクターの頭部・顔は上部にあるため、Y方向は最上部(0)を基準とし、
+        // 下部のドック(Y=165〜)に重要な絵が被らないようにする
+        val actualCropY = 0
+
+        return Bitmap.createBitmap(source, actualCropX, actualCropY, cropSize, cropSize)
+    }
+
+    private fun processBitmapWithBottomFade(source: Bitmap, fadeToColor: Int, targetSize: Int = 240): Bitmap {
+        // ★ スマートフォーカス ＆ 上側オフセットで1:1切り抜き
+        val focusedSquare = cropSmartFocusSquare(source)
+        val scaled = Bitmap.createScaledBitmap(focusedSquare, targetSize, targetSize, true)
 
         val result = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
         val canvas = Canvas(result)
