@@ -42,10 +42,12 @@ object BluetoothSppManager {
     private var inputStream: InputStream? = null
     private var receiveJob: Job? = null
     private var reconnectJob: Job? = null
+    private var activeSendJob: Job? = null
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
     private val sendMutex = Mutex()
+    private val connectMutex = Mutex()
 
     private var targetDevice: BluetoothDevice? = null
     private var isAutoReconnectActive = true
@@ -65,8 +67,8 @@ object BluetoothSppManager {
     private fun acquireWakeLock() {
         try {
             if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire(24 * 60 * 60 * 1000L) // 最大24時間
-                Log.d(TAG, "WakeLock acquired: CPU will not sleep")
+                wakeLock?.acquire(24 * 60 * 60 * 1000L)
+                Log.d(TAG, "WakeLock acquired")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to acquire WakeLock", e)
@@ -79,9 +81,7 @@ object BluetoothSppManager {
                 wakeLock?.release()
                 Log.d(TAG, "WakeLock released")
             }
-        } catch (e: Exception) {
-            // ignore
-        }
+        } catch (e: Exception) {}
     }
 
     @SuppressLint("MissingPermission")
@@ -91,7 +91,9 @@ object BluetoothSppManager {
         reconnectJob?.cancel()
 
         scope.launch {
-            internalConnect(device)
+            connectMutex.withLock {
+                internalConnect(device)
+            }
         }
     }
 
@@ -127,6 +129,7 @@ object BluetoothSppManager {
             targetDevice = null
             reconnectJob?.cancel()
         }
+        activeSendJob?.cancel()
         closeSocketOnly()
         releaseWakeLock()
         _connectionStatus.value = ConnectionStatus.DISCONNECTED
@@ -146,14 +149,18 @@ object BluetoothSppManager {
 
     private fun triggerAutoReconnect() {
         if (!isAutoReconnectActive || targetDevice == null) return
-        reconnectJob?.cancel()
+        if (reconnectJob?.isActive == true) return
+
         reconnectJob = scope.launch {
             while (isActive && isAutoReconnectActive && _connectionStatus.value != ConnectionStatus.CONNECTED) {
-                Log.d(TAG, "Auto-reconnect waiting 3s before retry...")
                 delay(3000)
                 val dev = targetDevice ?: break
-                Log.d(TAG, "Retrying Bluetooth connection to ${dev.name ?: dev.address}...")
-                internalConnect(dev)
+                connectMutex.withLock {
+                    if (isAutoReconnectActive && _connectionStatus.value != ConnectionStatus.CONNECTED) {
+                        Log.d(TAG, "Auto-reconnecting to ${dev.name ?: dev.address}...")
+                        internalConnect(dev)
+                    }
+                }
             }
         }
     }
@@ -173,10 +180,7 @@ object BluetoothSppManager {
             try {
                 while (isActive) {
                     val b = stream.read()
-                    if (b == -1) {
-                        Log.d(TAG, "Stream reached EOF (Socket closed)")
-                        break
-                    }
+                    if (b == -1) break
 
                     when (state) {
                         0 -> if (b == 0xAA) state = 1
@@ -216,7 +220,7 @@ object BluetoothSppManager {
                     }
                 }
             } catch (e: Exception) {
-                Log.d(TAG, "SPP Receive loop error: ${e.message}")
+                Log.d(TAG, "SPP Receive loop ended: ${e.message}")
             } finally {
                 if (_connectionStatus.value == ConnectionStatus.CONNECTED) {
                     _connectionStatus.value = ConnectionStatus.ERROR
@@ -235,6 +239,9 @@ object BluetoothSppManager {
         }
     }
 
+    /**
+     * ★ 古い送信ジョブを即座にキャンセルし、常に最新のパケットのみを高速送信
+     */
     fun sendMediaPacket(
         title: String,
         artist: String,
@@ -243,13 +250,18 @@ object BluetoothSppManager {
         rgb565Color: Int = 0x067F,
         rgb565BgColor: Int = 0x0000
     ) {
-        scope.launch {
+        // 現在送信中のジョブがあれば破棄して新しい曲を優先
+        activeSendJob?.cancel()
+
+        activeSendJob = scope.launch {
             if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
 
             sendMutex.withLock {
                 try {
                     val out = outputStream ?: return@withLock
+                    if (!isActive) return@withLock
 
+                    // 1. メタデータ送信
                     val metadataMap = mapOf(
                         "title" to title,
                         "artist" to artist,
@@ -262,25 +274,28 @@ object BluetoothSppManager {
                     out.write(metaPacket)
                     out.flush()
 
-                    delay(180)
+                    delay(100)
 
-                    if (jpegBytes != null && jpegBytes.isNotEmpty()) {
+                    // 2. JPEGパケット送信 (チャンク256B, ディレイ5msで0.3秒以内に完了)
+                    if (jpegBytes != null && jpegBytes.isNotEmpty() && isActive) {
                         val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
                         var offset = 0
-                        val chunkSize = 128
-                        while (offset < imgPacket.size) {
+                        val chunkSize = 256
+                        while (offset < imgPacket.size && isActive) {
                             val len = minOf(chunkSize, imgPacket.size - offset)
                             out.write(imgPacket, offset, len)
                             out.flush()
                             offset += len
-                            delay(12)
+                            delay(5)
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to send media packet: ${e.message}")
-                    _connectionStatus.value = ConnectionStatus.ERROR
-                    closeSocketOnly()
-                    triggerAutoReconnect()
+                    if (e !is CancellationException) {
+                        Log.e(TAG, "Failed to send media packet: ${e.message}")
+                        _connectionStatus.value = ConnectionStatus.ERROR
+                        closeSocketOnly()
+                        triggerAutoReconnect()
+                    }
                 }
             }
         }

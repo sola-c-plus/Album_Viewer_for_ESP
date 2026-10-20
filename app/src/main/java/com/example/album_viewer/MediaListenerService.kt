@@ -1,12 +1,15 @@
 package com.example.album_viewer
 
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -35,6 +38,7 @@ import android.util.Log
 import android.util.LruCache
 import android.util.Size
 import android.view.KeyEvent
+import androidx.core.app.NotificationCompat
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
@@ -50,6 +54,8 @@ class MediaListenerService : NotificationListenerService() {
 
     companion object {
         private const val TAG = "MediaListenerService"
+        private const val CHANNEL_ID = "album_viewer_fg_channel"
+        private const val NOTIF_ID = 9901
     }
 
     private var sessionManager: MediaSessionManager? = null
@@ -62,8 +68,6 @@ class MediaListenerService : NotificationListenerService() {
 
     private val activeControllers = ConcurrentHashMap<MediaController, MediaController.Callback>()
     private val handledNotificationKeys = LruCache<String, Long>(50)
-
-    // ★ アルバムアートのメモリキャッシュ（高速スキップ・再訪時の即時表示用）
     private val artworkCache = LruCache<String, Bitmap>(30)
 
     private var currentTitle = ""
@@ -81,7 +85,47 @@ class MediaListenerService : NotificationListenerService() {
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         registerControllerCallbacks(controllers)
-        triggerUpdateWithDebounce(100)
+        triggerUpdateWithDebounce(200)
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        BluetoothSppManager.init(applicationContext)
+        startForegroundNotification()
+    }
+
+    private fun startForegroundNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "ESP32 Music Display Service",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "ESP32とのBluetooth接続をスリープ中も維持します"
+                setShowBadge(false)
+            }
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.createNotificationChannel(channel)
+        }
+
+        val notif = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("ESP32 Display 接続待機中")
+            .setContentText("音楽再生と通知をESP32に中継しています")
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+            Log.d(TAG, "Foreground service started successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start foreground service: ${e.message}")
+        }
     }
 
     override fun onListenerConnected() {
@@ -96,7 +140,6 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "Failed to register active sessions listener", e)
         }
 
-        // ESP32からの物理ボタン入力を受信
         BluetoothSppManager.onCommandReceived = { cmd ->
             handleMediaCommand(cmd)
         }
@@ -144,7 +187,7 @@ class MediaListenerService : NotificationListenerService() {
                 if (targetController != null) {
                     val controls = targetController.transportControls
                     when (cmd.toInt()) {
-                        0x01 -> { // PLAY_PAUSE
+                        0x01 -> {
                             val state = targetController.playbackState?.state
                             if (state == PlaybackState.STATE_PLAYING) {
                                 controls.pause()
@@ -152,8 +195,8 @@ class MediaListenerService : NotificationListenerService() {
                                 controls.play()
                             }
                         }
-                        0x02 -> controls.skipToNext() // NEXT
-                        0x03 -> controls.skipToPrevious() // PREV
+                        0x02 -> controls.skipToNext()
+                        0x03 -> controls.skipToPrevious()
                     }
                     Log.d(TAG, "Executed command 0x%02X on %s".format(cmd, targetController.packageName))
                 } else {
@@ -170,7 +213,7 @@ class MediaListenerService : NotificationListenerService() {
                         Log.d(TAG, "Dispatched fallback KeyEvent: $keyCode")
                     }
                 }
-                triggerUpdateWithDebounce(50)
+                triggerUpdateWithDebounce(100)
             } catch (e: Exception) {
                 Log.e(TAG, "Error handling media command: $cmd", e)
             }
@@ -183,11 +226,11 @@ class MediaListenerService : NotificationListenerService() {
             handleNotificationPopup(sbn)
             return
         }
-        triggerUpdateWithDebounce(100)
+        triggerUpdateWithDebounce(200)
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
-        triggerUpdateWithDebounce(150)
+        triggerUpdateWithDebounce(200)
     }
 
     private fun shouldShowNotificationPopup(sbn: StatusBarNotification): Boolean {
@@ -275,19 +318,17 @@ class MediaListenerService : NotificationListenerService() {
         for (controller in controllers) {
             val callback = object : MediaController.Callback() {
                 override fun onMetadataChanged(metadata: MediaMetadata?) {
-                    triggerUpdateWithDebounce(80)
+                    triggerUpdateWithDebounce(150)
                 }
 
                 override fun onPlaybackStateChanged(state: PlaybackState?) {
-                    triggerUpdateWithDebounce(80)
+                    triggerUpdateWithDebounce(150)
                 }
             }
             try {
                 controller.registerCallback(callback)
                 activeControllers[controller] = callback
-            } catch (e: Exception) {
-                // ignore
-            }
+            } catch (e: Exception) {}
         }
     }
 
@@ -295,9 +336,7 @@ class MediaListenerService : NotificationListenerService() {
         for ((controller, callback) in activeControllers) {
             try {
                 controller.unregisterCallback(callback)
-            } catch (e: Exception) {
-                // ignore
-            }
+            } catch (e: Exception) {}
         }
         activeControllers.clear()
     }
@@ -306,7 +345,7 @@ class MediaListenerService : NotificationListenerService() {
         monitorJob?.cancel()
         monitorJob = serviceScope.launch {
             while (isActive) {
-                delay(800)
+                delay(1000)
                 if (!isShowingNotificationPopup) {
                     updateActiveMedia()
                 }
@@ -370,7 +409,6 @@ class MediaListenerService : NotificationListenerService() {
                     BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes, rgb565Accent, rgb565Bg)
                     Log.d(TAG, "Sent Track Art: ${trackInfo.title} (hasArt=$hasArt)")
 
-                    // ★ 画像がまだ届いていない場合は、音楽アプリのアート非同期取得を連続追跡
                     if (!hasArt) {
                         scheduleAdaptiveArtworkRetry(trackInfo.title, trackInfo.packageName)
                     }
@@ -408,22 +446,17 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
-    /**
-     * ★ 高速スキップ追跡：音楽アプリが後からアルバムアートを読み込むタイミングを段階的に追跡
-     */
     private fun scheduleAdaptiveArtworkRetry(targetTitle: String, targetPackage: String) {
         artworkRetryJob?.cancel()
         artworkRetryJob = serviceScope.launch {
-            val delays = longArrayOf(100, 200, 350, 500, 800, 1200, 1800)
+            val delays = longArrayOf(200, 400, 700, 1200)
             for (d in delays) {
                 delay(d)
                 if (!isActive) break
-                // 既に別の曲にスキップされていたら即座に中断
                 if (currentTitle != targetTitle) break
 
                 val track = detectCurrentActiveTrack()
                 if (track != null && track.title == targetTitle && track.bitmap != null) {
-                    // 本物のアートが届いた！即時更新
                     triggerUpdateDirect()
                     break
                 }
@@ -497,97 +530,13 @@ class MediaListenerService : NotificationListenerService() {
         return (r shl 11) or (g shl 5) or b
     }
 
-    private fun cropSmartFocusSquare(source: Bitmap): Bitmap {
-        val width = source.width
-        val height = source.height
-        val aspectRatio = width.toFloat() / height.toFloat()
-
-        if (aspectRatio < 1.15f) {
-            val minEdge = minOf(width, height)
-            val cropX = (width - minEdge) / 2
-            val cropY = (height - minEdge) / 2
-            return Bitmap.createBitmap(source, cropX, cropY, minEdge, minEdge)
-        }
-
-        val sampleW = 64
-        val sampleH = 36
-        val sampleBmp = Bitmap.createScaledBitmap(source, sampleW, sampleH, false)
-        val pixels = IntArray(sampleW * sampleH)
-        sampleBmp.getPixels(pixels, 0, sampleW, 0, 0, sampleW, sampleH)
-
-        val hsv = FloatArray(3)
-        val colEnergy = FloatArray(sampleW)
-
-        for (x in 0 until sampleW) {
-            var energySum = 0f
-            val normX = x.toFloat() / sampleW
-            val isExtremeEdgeX = normX < 0.06f || normX > 0.94f
-
-            for (y in 0 until sampleH) {
-                val idx = y * sampleW + x
-                val c = pixels[idx]
-                Color.colorToHSV(c, hsv)
-                val h = hsv[0]
-                val s = hsv[1]
-                val v = hsv[2]
-
-                val isWarmOrSkin = (h in 5f..50f || h in 320f..360f) && (s in 0.12f..0.75f) && (v in 0.35f..0.98f)
-                val skinBonus = if (isWarmOrSkin) 2.4f else 1.0f
-
-                val isTextOrUi = (s < 0.10f && (v > 0.88f || v < 0.15f))
-                val textPenalty = if (isTextOrUi) 0.25f else 1.0f
-
-                var edge = 0f
-                if (x < sampleW - 1) {
-                    val rightC = pixels[idx + 1]
-                    val rDiff = Math.abs(Color.red(c) - Color.red(rightC))
-                    val gDiff = Math.abs(Color.green(c) - Color.green(rightC))
-                    val bDiff = Math.abs(Color.blue(c) - Color.blue(rightC))
-                    edge = ((rDiff + gDiff + bDiff) / 765f).coerceAtMost(0.6f)
-                }
-
-                val yWeight = if (y > sampleH * 0.7f) 0.4f else 1.0f
-                var pEnergy = (edge * 0.35f + s * 0.45f + v * 0.2f) * skinBonus * textPenalty * yWeight
-                if (isExtremeEdgeX) pEnergy *= 0.2f
-
-                energySum += pEnergy
-            }
-
-            val distCenter = Math.abs(normX - 0.5f)
-            val compBias = 1.0f - distCenter * 0.35f
-            colEnergy[x] = energySum * compBias
-        }
-
-        val cropSize = (height * 0.88f).toInt()
-        val windowW = (sampleH * 0.88f).toInt()
-
-        var maxEnergy = -1f
-        var bestStartX = 0
-
-        for (x in 0..(sampleW - windowW)) {
-            var currentWindowEnergy = 0f
-            for (w in 0 until windowW) {
-                currentWindowEnergy += colEnergy[x + w]
-            }
-            if (currentWindowEnergy > maxEnergy) {
-                maxEnergy = currentWindowEnergy
-                bestStartX = x
-            }
-        }
-
-        val scale = width.toFloat() / sampleW.toFloat()
-        var actualCropX = (bestStartX * scale).toInt()
-        val maxCropX = width - cropSize
-        if (actualCropX < 0) actualCropX = 0
-        if (actualCropX > maxCropX) actualCropX = maxCropX
-
-        val actualCropY = 0
-        return Bitmap.createBitmap(source, actualCropX, actualCropY, cropSize, cropSize)
-    }
-
     private fun processBitmapWithBottomFade(source: Bitmap, fadeToColor: Int, targetSize: Int = 240): Bitmap {
-        val focusedSquare = cropSmartFocusSquare(source)
-        val scaled = Bitmap.createScaledBitmap(focusedSquare, targetSize, targetSize, true)
+        val minEdge = minOf(source.width, source.height)
+        val cropX = (source.width - minEdge) / 2
+        val cropY = (source.height - minEdge) / 2
+
+        val cropped = Bitmap.createBitmap(source, cropX, cropY, minEdge, minEdge)
+        val scaled = Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
 
         val result = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
         val canvas = Canvas(result)
@@ -661,10 +610,8 @@ class MediaListenerService : NotificationListenerService() {
                     var bitmap = artworkCache.get(cacheKey)
 
                     if (bitmap == null) {
-                        // 1. MediaMetadataから直接取得
                         bitmap = extractArtworkFromMetadata(metadata)
 
-                        // 2. 通知から取得（★超重要：通知の曲名が現在の曲名と一致している場合のみ採用！）
                         if (bitmap == null && matchingSbn != null) {
                             val sbnTitle = extractTitle(null, matchingSbn.notification?.extras)
                             if (isTitleMatch(title, sbnTitle)) {
@@ -672,7 +619,6 @@ class MediaListenerService : NotificationListenerService() {
                             }
                         }
 
-                        // 3. ローカルMediaStore または 高解像度通知フォールバック
                         if (bitmap == null) {
                             bitmap = findLocalArtworkByMediaStore(title, artist)
                                 ?: getNotificationHighResArtFallback(title)
@@ -734,9 +680,6 @@ class MediaListenerService : NotificationListenerService() {
             .firstOrNull()
     }
 
-    /**
-     * 曲名が一致しているかを判定（通知の遅延による前の曲のアートワーク誤爆を防ぐ）
-     */
     private fun isTitleMatch(currentTitle: String, notifTitle: String): Boolean {
         if (currentTitle.isBlank() || notifTitle.isBlank()) return false
         val t1 = currentTitle.trim().lowercase()
@@ -839,9 +782,7 @@ class MediaListenerService : NotificationListenerService() {
                             val itemUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, mediaId)
                             val thumb = contentResolver.loadThumbnail(itemUri, Size(240, 240), null)
                             if (thumb != null) return thumb
-                        } catch (e: Exception) {
-                            // ignore
-                        }
+                        } catch (e: Exception) {}
                     }
 
                     if (albumId > 0) {
@@ -854,9 +795,7 @@ class MediaListenerService : NotificationListenerService() {
                                 val bmp = BitmapFactory.decodeStream(inputStream)
                                 if (bmp != null) return bmp
                             }
-                        } catch (e: Exception) {
-                            // ignore
-                        }
+                        } catch (e: Exception) {}
                     }
                 }
             }
@@ -980,7 +919,6 @@ class MediaListenerService : NotificationListenerService() {
                 "http", "https" -> {
                     val url = URL(uriStr)
                     val conn = url.openConnection() as HttpURLConnection
-                    // 高速スキップ対応のためタイムアウトを1.2秒に短縮
                     conn.connectTimeout = 1200
                     conn.readTimeout = 1200
                     conn.setRequestProperty("User-Agent", "Mozilla/5.0")
