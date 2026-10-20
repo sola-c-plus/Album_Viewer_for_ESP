@@ -43,6 +43,8 @@ import androidx.core.content.ContextCompat
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        BluetoothSppManager.init(applicationContext)
+
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
@@ -89,7 +91,6 @@ fun MainScreen() {
         mutableStateOf(NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName))
     }
 
-    // バッテリー最適化除外の確認
     val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     var isIgnoringBatteryOptimizations by remember {
         mutableStateOf(powerManager.isIgnoringBatteryOptimizations(context.packageName))
@@ -136,7 +137,6 @@ fun MainScreen() {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 権限 ＆ バッテリー設定カード
         if (!isNotificationAccessGranted || !hasBtPermission || !isIgnoringBatteryOptimizations) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF332020)),
@@ -145,7 +145,7 @@ fun MainScreen() {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text("必要な権限・バックグラウンド設定", fontWeight = FontWeight.Bold, color = Color(0xFFFF6B6B))
                     Spacer(modifier = Modifier.height(6.dp))
-                    
+
                     if (!isNotificationAccessGranted) {
                         Button(
                             onClick = {
@@ -199,7 +199,7 @@ fun MainScreen() {
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("Bluetooth接続", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text("Bluetooth接続 (自動再接続・スリープ維持機能付き)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Spacer(modifier = Modifier.height(8.dp))
 
                 ExposedDropdownMenuBox(
@@ -238,8 +238,8 @@ fun MainScreen() {
                 ) {
                     val (statusText, statusColor) = when (connectionStatus) {
                         ConnectionStatus.CONNECTED -> "接続完了 (${connectedDeviceName})" to Color(0xFF4CAF50)
-                        ConnectionStatus.CONNECTING -> "接続中..." to Color(0xFFFFC107)
-                        ConnectionStatus.ERROR -> "接続エラー" to Color(0xFFF44336)
+                        ConnectionStatus.CONNECTING -> "接続中 / 自動再接続中..." to Color(0xFFFFC107)
+                        ConnectionStatus.ERROR -> "接続待機中 (自動リトライ)" to Color(0xFFF44336)
                         ConnectionStatus.DISCONNECTED -> "未接続" to Color.Gray
                     }
                     Box(modifier = Modifier.size(10.dp).background(statusColor, CircleShape))
@@ -266,7 +266,7 @@ fun MainScreen() {
                     Spacer(modifier = Modifier.width(8.dp))
 
                     OutlinedButton(
-                        onClick = { BluetoothSppManager.disconnect() },
+                        onClick = { BluetoothSppManager.disconnect(isManual = true) },
                         enabled = connectionStatus == ConnectionStatus.CONNECTED ||
                                   connectionStatus == ConnectionStatus.CONNECTING,
                         modifier = Modifier.weight(1f)

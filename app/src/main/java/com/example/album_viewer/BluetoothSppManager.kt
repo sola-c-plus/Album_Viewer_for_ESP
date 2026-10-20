@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
+import android.content.Context
+import android.os.PowerManager
 import android.util.Log
 import com.google.gson.Gson
 import kotlinx.coroutines.*
@@ -39,63 +41,120 @@ object BluetoothSppManager {
     private var outputStream: OutputStream? = null
     private var inputStream: InputStream? = null
     private var receiveJob: Job? = null
+    private var reconnectJob: Job? = null
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
     private val sendMutex = Mutex()
 
-    // ESP32からのボタンコマンドコールバック (0x01: Play/Pause, 0x02: Next, 0x03: Prev)
+    private var targetDevice: BluetoothDevice? = null
+    private var isAutoReconnectActive = true
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var appContext: Context? = null
+
     var onCommandReceived: ((Byte) -> Unit)? = null
 
-    @SuppressLint("MissingPermission")
-    fun connect(device: BluetoothDevice) {
-        scope.launch {
-            disconnect()
-            _connectionStatus.value = ConnectionStatus.CONNECTING
-            _connectedDeviceName.value = device.name ?: device.address
-
-            try {
-                BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery()
-                val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
-                s.connect()
-                socket = s
-                outputStream = s.outputStream
-                inputStream = s.inputStream
-                _connectionStatus.value = ConnectionStatus.CONNECTED
-                Log.d(TAG, "Bluetooth connected: ${device.name}")
-
-                startReceiveLoop()
-            } catch (e: Exception) {
-                Log.e(TAG, "Bluetooth connection failed", e)
-                _connectionStatus.value = ConnectionStatus.ERROR
-                disconnect()
-            }
+    fun init(context: Context) {
+        if (appContext == null) {
+            appContext = context.applicationContext
+            val pm = appContext!!.getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AlbumViewer:BluetoothWakeLock")
         }
     }
 
-    fun disconnect() {
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(24 * 60 * 60 * 1000L) // 最大24時間
+                Log.d(TAG, "WakeLock acquired: CPU will not sleep")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to acquire WakeLock", e)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+                Log.d(TAG, "WakeLock released")
+            }
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connect(device: BluetoothDevice) {
+        targetDevice = device
+        isAutoReconnectActive = true
+        reconnectJob?.cancel()
+
+        scope.launch {
+            internalConnect(device)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun internalConnect(device: BluetoothDevice) {
+        closeSocketOnly()
+        _connectionStatus.value = ConnectionStatus.CONNECTING
+        _connectedDeviceName.value = device.name ?: device.address
+
+        try {
+            BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery()
+            val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
+            s.connect()
+            socket = s
+            outputStream = s.outputStream
+            inputStream = s.inputStream
+            _connectionStatus.value = ConnectionStatus.CONNECTED
+            Log.d(TAG, "Bluetooth connected: ${device.name}")
+
+            acquireWakeLock()
+            startReceiveLoop()
+        } catch (e: Exception) {
+            Log.e(TAG, "Bluetooth connection failed: ${e.message}")
+            _connectionStatus.value = ConnectionStatus.ERROR
+            closeSocketOnly()
+            triggerAutoReconnect()
+        }
+    }
+
+    fun disconnect(isManual: Boolean = true) {
+        if (isManual) {
+            isAutoReconnectActive = false
+            targetDevice = null
+            reconnectJob?.cancel()
+        }
+        closeSocketOnly()
+        releaseWakeLock()
+        _connectionStatus.value = ConnectionStatus.DISCONNECTED
+        _connectedDeviceName.value = null
+    }
+
+    private fun closeSocketOnly() {
         receiveJob?.cancel()
         receiveJob = null
-        try {
-            inputStream?.close()
-        } catch (e: Exception) {
-            // ignore
-        }
-        try {
-            outputStream?.close()
-        } catch (e: Exception) {
-            // ignore
-        }
-        try {
-            socket?.close()
-        } catch (e: Exception) {
-            // ignore
-        } finally {
-            socket = null
-            outputStream = null
-            inputStream = null
-            _connectionStatus.value = ConnectionStatus.DISCONNECTED
-            _connectedDeviceName.value = null
+        try { inputStream?.close() } catch (e: Exception) {}
+        try { outputStream?.close() } catch (e: Exception) {}
+        try { socket?.close() } catch (e: Exception) {}
+        socket = null
+        outputStream = null
+        inputStream = null
+    }
+
+    private fun triggerAutoReconnect() {
+        if (!isAutoReconnectActive || targetDevice == null) return
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            while (isActive && isAutoReconnectActive && _connectionStatus.value != ConnectionStatus.CONNECTED) {
+                Log.d(TAG, "Auto-reconnect waiting 3s before retry...")
+                delay(3000)
+                val dev = targetDevice ?: break
+                Log.d(TAG, "Retrying Bluetooth connection to ${dev.name ?: dev.address}...")
+                internalConnect(dev)
+            }
         }
     }
 
@@ -103,7 +162,7 @@ object BluetoothSppManager {
         receiveJob?.cancel()
         receiveJob = scope.launch {
             val stream = inputStream ?: return@launch
-            var state = 0 // 0: WAIT_AA, 1: WAIT_55, 2: WAIT_TYPE, 3: WAIT_LEN, 4: READ_PAYLOAD
+            var state = 0
             var packetType: Byte = 0
             var packetLen = 0
             var lenBytesRead = 0
@@ -114,19 +173,14 @@ object BluetoothSppManager {
             try {
                 while (isActive) {
                     val b = stream.read()
-                    if (b == -1) break
+                    if (b == -1) {
+                        Log.d(TAG, "Stream reached EOF (Socket closed)")
+                        break
+                    }
 
                     when (state) {
-                        0 -> {
-                            if (b == 0xAA) state = 1
-                        }
-                        1 -> {
-                            if (b == 0x55) {
-                                state = 2
-                            } else if (b != 0xAA) {
-                                state = 0
-                            }
-                        }
+                        0 -> if (b == 0xAA) state = 1
+                        1 -> if (b == 0x55) state = 2 else if (b != 0xAA) state = 0
                         2 -> {
                             packetType = b.toByte()
                             lenBytesRead = 0
@@ -162,8 +216,12 @@ object BluetoothSppManager {
                     }
                 }
             } catch (e: Exception) {
-                if (isActive) {
-                    Log.d(TAG, "SPP Receive loop ended: ${e.message}")
+                Log.d(TAG, "SPP Receive loop error: ${e.message}")
+            } finally {
+                if (_connectionStatus.value == ConnectionStatus.CONNECTED) {
+                    _connectionStatus.value = ConnectionStatus.ERROR
+                    closeSocketOnly()
+                    triggerAutoReconnect()
                 }
             }
         }
@@ -172,12 +230,11 @@ object BluetoothSppManager {
     private fun handleReceivedPacket(type: Byte, payload: ByteArray) {
         if (type == 0x04.toByte() && payload.isNotEmpty()) {
             val cmd = payload[0]
-            Log.d(TAG, "Media Control Command Received: 0x%02X".format(cmd))
+            Log.d(TAG, "Media Control Command: 0x%02X".format(cmd))
             onCommandReceived?.invoke(cmd)
         }
     }
 
-    // ★ rgb565Color (アクセント色) と rgb565BgColor (文字裏背景色) を送信
     fun sendMediaPacket(
         title: String,
         artist: String,
@@ -220,9 +277,10 @@ object BluetoothSppManager {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to send media packet", e)
+                    Log.e(TAG, "Failed to send media packet: ${e.message}")
                     _connectionStatus.value = ConnectionStatus.ERROR
-                    disconnect()
+                    closeSocketOnly()
+                    triggerAutoReconnect()
                 }
             }
         }

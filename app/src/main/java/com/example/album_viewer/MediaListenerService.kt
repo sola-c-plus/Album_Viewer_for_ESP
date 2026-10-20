@@ -1,12 +1,15 @@
 package com.example.album_viewer
 
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -35,6 +38,7 @@ import android.util.Log
 import android.util.LruCache
 import android.util.Size
 import android.view.KeyEvent
+import androidx.core.app.NotificationCompat
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
@@ -50,6 +54,8 @@ class MediaListenerService : NotificationListenerService() {
 
     companion object {
         private const val TAG = "MediaListenerService"
+        private const val NOTIFICATION_ID = 9001
+        private const val CHANNEL_ID = "esp32_display_foreground_channel"
     }
 
     private var sessionManager: MediaSessionManager? = null
@@ -83,6 +89,11 @@ class MediaListenerService : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        BluetoothSppManager.init(applicationContext)
+
+        // フォアグラウンド常駐通知を開始（スリープキラー防止）
+        startKeepAliveForegroundNotification("ESP32 Display 接続準備完了")
+
         sessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
         val component = ComponentName(this, MediaListenerService::class.java)
         try {
@@ -93,28 +104,69 @@ class MediaListenerService : NotificationListenerService() {
             Log.e(TAG, "Failed to register active sessions listener", e)
         }
 
-        // ESP32からの物理ボタン入力を受信
         BluetoothSppManager.onCommandReceived = { cmd ->
             handleMediaCommand(cmd)
         }
 
         serviceScope.launch {
             BluetoothSppManager.connectionStatus.collect { status ->
-                if (status == ConnectionStatus.CONNECTED) {
-                    delay(800)
-                    isStandbyScreenActive = false
-                    currentTitle = ""
-                    currentArtist = ""
-                    currentPackage = ""
-                    lastSentTrackSignature = ""
-                    lastSentMinute = -1
-                    stopDetectionTimestamp = 0L
-                    triggerUpdateDirect()
+                when (status) {
+                    ConnectionStatus.CONNECTED -> {
+                        startKeepAliveForegroundNotification("ESP32 接続中 (${BluetoothSppManager.connectedDeviceName.value ?: ""})")
+                        delay(800)
+                        isStandbyScreenActive = false
+                        currentTitle = ""
+                        currentArtist = ""
+                        currentPackage = ""
+                        lastSentTrackSignature = ""
+                        lastSentMinute = -1
+                        stopDetectionTimestamp = 0L
+                        triggerUpdateDirect()
+                    }
+                    ConnectionStatus.CONNECTING -> {
+                        startKeepAliveForegroundNotification("ESP32 再接続を試行中...")
+                    }
+                    ConnectionStatus.DISCONNECTED, ConnectionStatus.ERROR -> {
+                        startKeepAliveForegroundNotification("ESP32 未接続 (バックグラウンド待機中)")
+                    }
                 }
             }
         }
 
         startMonitoringLoop()
+    }
+
+    private fun startKeepAliveForegroundNotification(statusText: String) {
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "ESP32 Display Keep-Alive",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "ESP32との常時Bluetooth接続を維持します"
+                setShowBadge(false)
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("ESP32 Music Display")
+            .setContentText(statusText)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start foreground service", e)
+        }
     }
 
     override fun onDestroy() {
@@ -141,7 +193,7 @@ class MediaListenerService : NotificationListenerService() {
                 if (targetController != null) {
                     val controls = targetController.transportControls
                     when (cmd.toInt()) {
-                        0x01 -> { // PLAY_PAUSE
+                        0x01 -> {
                             val state = targetController.playbackState?.state
                             if (state == PlaybackState.STATE_PLAYING) {
                                 controls.pause()
@@ -149,8 +201,8 @@ class MediaListenerService : NotificationListenerService() {
                                 controls.play()
                             }
                         }
-                        0x02 -> controls.skipToNext() // NEXT
-                        0x03 -> controls.skipToPrevious() // PREV
+                        0x02 -> controls.skipToNext()
+                        0x03 -> controls.skipToPrevious()
                     }
                     Log.d(TAG, "Executed command 0x%02X on %s".format(cmd, targetController.packageName))
                 } else {
