@@ -37,6 +37,13 @@ object BluetoothSppManager {
     private const val IMAGE_ACK_TIMEOUT_MS = 10_000L
     // ACK 未確認のまま保持する送信レコードの上限 (FIFO。あふれた最古は回復対象から外す)
     private const val MAX_PENDING_IMAGE_SENDS = 4
+    // NG 再送の上限。実機では初回転送に続いて再送自体も途中で止まった例があり
+    // (2026-10-27 承認ポップアップ: 初回 3,800/5,336B、再送 4,461/5,336B で停止)、
+    // 1回では回復しきれなかったため、NG 起因の再送は最大3回まで挑戦する。
+    private const val MAX_NG_RESENDS = 3
+    // NG 再送前の待ち時間。ESP が受信タイムアウトでリセットした直後はリンクが
+    // 落ち着かないことがあるため、少し間を空けてから再送する。
+    private const val NG_RESEND_BACKOFF_MS = 400L
     private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
     private val _connectionStatus = MutableStateFlow(ConnectionStatus.DISCONNECTED)
@@ -74,9 +81,10 @@ object BluetoothSppManager {
         var acked: Boolean = false
         // 再送予算は起因別に分離する。タイムアウト再送は「ESP がまだ受信中かも
         // しれない」段階での仮回復なので、その後本物の NG が来たときにも再送
-        // できるよう、NG 再送とは別枠にする (各最大1回)。
+        // できるよう、NG 再送とは別枠にする (タイムアウト再送は最大1回、
+        // NG 再送は最大 MAX_NG_RESENDS 回)。
         var timeoutResendUsed: Boolean = false
-        var ngResendUsed: Boolean = false
+        var ngResendCount: Int = 0
         var watchdogJob: Job? = null
         var resendJob: Job? = null
     }
@@ -87,6 +95,13 @@ object BluetoothSppManager {
     private val pendingImageSends = mutableListOf<ImageSendRecord>()
     private val pendingImageLock = Any()
     private var imageSendSeq = 0L
+
+    // OK で完了した最大の seq。これより古いレコードは、より新しい画像が既に
+    // 表示確定しているということなので、後から NG が届いても再送せず破棄する
+    // (スタンバイ復帰が表示された後に古いポップアップ画像が復活する等の
+    // 画面の巻き戻しを防ぐ)。
+    @Volatile
+    private var highestAckedSeq = 0L
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
@@ -314,6 +329,14 @@ object BluetoothSppManager {
         evicted.forEach { retireImageSendRecord(it) }
     }
 
+    // ★ より新しい画像が既に OK 完了しているレコードを、再送せず破棄する
+    // (引き継ぎ抑制)。保留キューから外し、見張り・再送ジョブも止める。
+    private fun discardSupersededImageSend(record: ImageSendRecord) {
+        synchronized(pendingImageLock) { pendingImageSends.remove(record) }
+        retireImageSendRecord(record)
+        Log.d(TAG, "Discarded superseded image instead of resending: seq=${record.seq} highestAckedSeq=$highestAckedSeq")
+    }
+
     // ★ キューから外れたレコードの見張り・再送ジョブを止める
     private fun retireImageSendRecord(record: ImageSendRecord) {
         record.watchdogJob?.cancel()
@@ -372,6 +395,8 @@ object BluetoothSppManager {
                     retireImageSendRecord(rec)
                 }
                 val matched = completed.last()
+                // 巻き戻し防止の判定用に、OK 完了した最大の seq を覚えておく
+                if (matched.seq > highestAckedSeq) highestAckedSeq = matched.seq
                 Log.d(TAG, "Image ACK OK: seq=${matched.seq} csum=%08X (completed ${completed.size} record(s))".format(matched.checksum))
             }
         } else {
@@ -417,6 +442,14 @@ object BluetoothSppManager {
         if (_connectionStatus.value != ConnectionStatus.CONNECTED) return
         // 既に ACK 完了したレコードやキューから失効したレコードは再送しない
         if (!isPendingImageSend(record)) return
+        // 引き継ぎ抑制: より新しい画像が既に OK 完了しているなら、この古い
+        // 画像は表示確定済みの内容に引き継がれている。再送すると画面が古い
+        // 内容へ巻き戻るため、再送せずレコードごと破棄する。
+        if (kind == ResendReason.ACK_NG && highestAckedSeq > record.seq) {
+            discardSupersededImageSend(record)
+            return
+        }
+        var ngAttempt = 0
         synchronized(record) {
             if (record.acked) return
             when (kind) {
@@ -425,15 +458,37 @@ object BluetoothSppManager {
                     record.timeoutResendUsed = true
                 }
                 ResendReason.ACK_NG -> {
-                    if (record.ngResendUsed) return
-                    record.ngResendUsed = true
+                    if (record.ngResendCount >= MAX_NG_RESENDS) {
+                        Log.w(TAG, "NG resend budget exhausted: seq=${record.seq}")
+                        return
+                    }
+                    record.ngResendCount++
+                    ngAttempt = record.ngResendCount
                 }
             }
         }
-        Log.d(TAG, "Resending image: seq=${record.seq} reason=$reason")
+        Log.d(TAG, "Resending image: seq=${record.seq} reason=$reason kind=$kind ngAttempt=$ngAttempt")
         // 再送ジョブはレコードに保持し、レコードの失効・切断時にキャンセルできるようにする
         record.resendJob?.cancel()
         record.resendJob = scope.launch {
+            if (kind == ResendReason.ACK_NG) {
+                // NG 再送の前には少し待つ。ESP が受信タイムアウトでリセット
+                // した直後はリンクが落ち着かないことがあり、間を空けた方が
+                // 再送が通りやすい。待ちの間にレコードが失効したら
+                // retireImageSendRecord がこのジョブをキャンセルするので
+                // delay からそのまま抜ける。キャンセルを免れても、書き込み
+                // 前に保留中・未 ACK・引き継ぎの有無を再確認する。
+                delay(NG_RESEND_BACKOFF_MS)
+                if (!isPendingImageSend(record)) {
+                    Log.d(TAG, "NG resend aborted after backoff, record no longer pending: seq=${record.seq}")
+                    return@launch
+                }
+                if (synchronized(record) { record.acked }) return@launch
+                if (highestAckedSeq > record.seq) {
+                    discardSupersededImageSend(record)
+                    return@launch
+                }
+            }
             sendPacketBody(
                 record.title,
                 record.artist,
@@ -526,9 +581,18 @@ object BluetoothSppManager {
                 // 再送の場合、Mutex を掴んだ時点でも対象レコードがまだ保留中か再確認する。
                 // 待ちの間に ACK 完了・切断・キューあふれで失効していたら何も書かずに終わる
                 // (失効した古いポップアップ画像が画面に復活してしまうのを防ぐ)。
-                if (resendOfSeq != null && findPendingImageSend(resendOfSeq) == null) {
-                    Log.d(TAG, "Resend aborted, record no longer pending: seq=$resendOfSeq")
-                    return@withLock
+                // あわせて、待ちの間により新しい画像が OK 完了していたら引き継ぎ
+                // 抑制として破棄し、画面の巻き戻しを防ぐ。
+                if (resendOfSeq != null) {
+                    val pendingRecord = findPendingImageSend(resendOfSeq)
+                    if (pendingRecord == null) {
+                        Log.d(TAG, "Resend aborted, record no longer pending: seq=$resendOfSeq")
+                        return@withLock
+                    }
+                    if (highestAckedSeq > resendOfSeq) {
+                        discardSupersededImageSend(pendingRecord)
+                        return@withLock
+                    }
                 }
 
                 // 1. メタデータ送信
