@@ -353,6 +353,13 @@ class MediaListenerService : NotificationListenerService() {
         val text = extractArtist(null, extras)
         if (title.isBlank() && text.isBlank()) return
 
+        // Muse の承認リクエスト通知は英文で ESP 上では読みにくいため、見出しだけ
+        // 日本語に差し替える。対象でない通知・名前が解決できない場合は null が
+        // 返り、原文のまま表示する (resolveApprovalWording 参照)。
+        val approvalWording = resolveApprovalWording(pkg, title, text)
+        val popupTitle = approvalWording?.first ?: title
+        val popupText = approvalWording?.second ?: text
+
         val appName = getAppDisplayName(pkg)
         val appIcon = getAppIconBitmap(pkg, notif)
         val accentColor = getAppAccentColor(pkg)
@@ -373,8 +380,8 @@ class MediaListenerService : NotificationListenerService() {
                     // まだ何も表示していない場合だけ最後の曲アートにフォールバックする。
                     baseBitmap = lastDisplayedBitmap ?: lastRawArtwork,
                     appName = appName,
-                    title = title.ifBlank { appName },
-                    text = text.ifBlank { "新しい通知があります" },
+                    title = popupTitle.ifBlank { appName },
+                    text = popupText.ifBlank { "新しい通知があります" },
                     appIcon = appIcon,
                     accentColor = accentColor,
                     targetSize = 240
@@ -384,8 +391,8 @@ class MediaListenerService : NotificationListenerService() {
                 // 届き切らない実績があるため、届く実績のあるサイズ (8KB) を目標にする。
                 val jpegBytes = compressToSafeBaselineJpeg(popupBitmap, targetBytes = 8192)
                 Log.d(TAG, "Popup image: ${jpegBytes?.size ?: -1} bytes")
-                val displayTitle = "🔔 $appName: $title"
-                val displayArtist = text
+                val displayTitle = "🔔 $appName: $popupTitle"
+                val displayArtist = popupText
                 val rgb565Color = colorToRgb565(accentColor)
                 val rgb565Bg = 0x0000
 
@@ -457,6 +464,118 @@ class MediaListenerService : NotificationListenerService() {
         BluetoothSppManager.sendMediaPacketQueued(title, artist, "", jpegBytes, rgb565Color, rgb565Bg) { success ->
             if (cont.isActive) cont.resume(success)
         }
+    }
+
+    // ---- 承認リクエスト通知の文言差し替え (案A) ----
+    //
+    // Muse (com.facebook.aura) の承認リクエスト通知は英文で、ESP の小さい画面では
+    // 読みにくい。見出しだけを「{名前}が承認を求めています！！」に差し替え、本文には
+    // 元の通知内容 (何の承認か) を残す。通常の Muse 通知 (作業完了報告など) まで
+    // 差し替えないよう、判定は保守的にする。
+
+    // 承認依頼とみなす言い回し。"approval" を含むことに加えて、これらの依頼系
+    // マーカーのいずれかを含む場合のみ承認リクエストと判定する (小文字で照合)。
+    private val approvalRequestMarkers = listOf(
+        "needs", "wants", "requesting", "requests", "requires", "required",
+        "waiting", "pending", "seeking"
+    )
+
+    // "<名前> needs approval" 型の文から名前を切り出すパターン (文頭アンカー)。
+    private val approvalNamePatterns = listOf(
+        Regex("""^\s*(.+?)\s+needs\s+(?:your\s+)?approval\b""", RegexOption.IGNORE_CASE),
+        Regex("""^\s*(.+?)\s+wants\s+your\s+approval\b""", RegexOption.IGNORE_CASE),
+        Regex("""^\s*(.+?)\s+is\s+requesting\s+approval\b""", RegexOption.IGNORE_CASE),
+        Regex("""^\s*(.+?)\s+requests\s+approval\b""", RegexOption.IGNORE_CASE),
+        Regex("""^\s*(.+?)\s+requires\s+(?:your\s+)?approval\b""", RegexOption.IGNORE_CASE)
+    )
+
+    // タイトル全体が承認依頼フレーズだけで中身 (何の承認か) を含まない場合の判定。
+    // この場合は本文へ重複して残さない。
+    private val approvalPhraseOnlyPatterns = listOf(
+        Regex("""(?i).*\b(?:needs|wants|requests|requires)\s+(?:your\s+)?approval\s*[.!]*"""),
+        Regex("""(?i)approval\s+(?:needed|required|request|pending)\s*[.!]*"""),
+        Regex("""(?i)(?:needs|waiting for)\s+approval\s*[.!]*""")
+    )
+
+    /**
+     * Muse の承認リクエスト通知なら、表示用の (見出し, 本文) を返す。
+     * 対象でない場合と、名前が解決できない場合は null (原文のまま表示)。
+     *
+     * 名前の解決順:
+     *   1. 通知文からの自動抽出 (extractAssistantName)
+     *   2. 設定「アシスタント名」(AppSettings、設定画面で入力)
+     *   3. どちらも無ければ差し替えない
+     *
+     * 本文は元のタイトル/本文から組み立て、元の内容を消さない。元のタイトルに
+     * 承認内容が含まれていれば本文側に残す (名前そのもの・承認依頼フレーズだけの
+     * タイトルは見出しと重複するため除く)。
+     */
+    private fun resolveApprovalWording(pkg: String, title: String, text: String): Pair<String, String>? {
+        if (!pkg.lowercase().contains("facebook.aura")) return null
+        if (!isApprovalRequestText(title, text)) return null
+
+        val name = extractAssistantName(title, text)
+            ?: AppSettings.getAssistantName(applicationContext).takeIf { it.isNotBlank() }
+            ?: return null
+
+        val heading = "${name}が承認を求めています！！"
+        val bodyParts = mutableListOf<String>()
+        if (title.isNotBlank() && title != name && !isApprovalPhraseOnly(title)) {
+            bodyParts += title
+        }
+        if (text.isNotBlank()) bodyParts += text
+        val body = bodyParts.joinToString(" ").ifBlank { text.ifBlank { title } }
+        return heading to body
+    }
+
+    // "approval" を含み、かつ依頼系マーカーを含む場合のみ承認リクエストとみなす。
+    // "Approval granted" のような完了報告はマーカーを含まないため対象外になる。
+    private fun isApprovalRequestText(title: String, text: String): Boolean {
+        val combined = "$title $text".lowercase()
+        if (!combined.contains("approval")) return false
+        // 「承認は不要」という意味の文は依頼ではないので除外する
+        if (combined.contains("no approval required") || combined.contains("approval not required")) return false
+        return approvalRequestMarkers.any { combined.contains(it) }
+    }
+
+    /**
+     * 通知文からアシスタント名を抽出する。取れなければ null。
+     * 例: 本文 "みう needs approval to run git push" → "みう"
+     *     本文 "Miu wants your approval for this action" → "Miu"
+     * 文パターンで取れない場合は、タイトル自体が名前らしい短文ならそれを使う
+     * (アプリ名 "Muse" と、承認フレーズを含むタイトルは名前として扱わない)。
+     */
+    private fun extractAssistantName(title: String, text: String): String? {
+        for (candidate in listOf(text, title)) {
+            for (pattern in approvalNamePatterns) {
+                val match = pattern.find(candidate) ?: continue
+                val name = match.groupValues[1].trim()
+                if (isPlausibleAssistantName(name)) return name
+            }
+        }
+        val t = title.trim()
+        if (isPlausibleAssistantName(t) &&
+            !t.contains("approval", ignoreCase = true) &&
+            !t.equals("Muse", ignoreCase = true)
+        ) {
+            return t
+        }
+        return null
+    }
+
+    // 名前らしさの検証。文の断片を名前と誤認しないよう、長さと記号で絞る。
+    private fun isPlausibleAssistantName(name: String): Boolean {
+        if (name.isBlank() || name.length > 24) return false
+        if (name.contains('\n')) return false
+        if (name.contains("approval", ignoreCase = true)) return false
+        if (name.any { it == '.' || it == '!' || it == '?' || it == ':' }) return false
+        return true
+    }
+
+    private fun isApprovalPhraseOnly(title: String): Boolean {
+        val t = title.trim()
+        if (t.equals("approval", ignoreCase = true)) return true
+        return approvalPhraseOnlyPatterns.any { it.matches(t) }
     }
 
     private fun registerControllerCallbacks(controllers: List<MediaController>?) {
