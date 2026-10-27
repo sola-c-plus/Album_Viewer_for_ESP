@@ -341,7 +341,10 @@ class MediaListenerService : NotificationListenerService() {
                 targetSize = 240
             )
 
-            val jpegBytes = compressToSafeBaselineJpeg(popupBitmap)
+            // ポップアップ画像は写真背景で大きくなりやすく、大きな転送が ESP に
+            // 届き切らない実績があるため、届く実績のあるサイズ (8KB) を目標にする。
+            val jpegBytes = compressToSafeBaselineJpeg(popupBitmap, targetBytes = 8192)
+            Log.d(TAG, "Popup image: ${jpegBytes?.size ?: -1} bytes")
             val displayTitle = "🔔 $appName: $title"
             val displayArtist = text
             val rgb565Color = colorToRgb565(accentColor)
@@ -1213,22 +1216,22 @@ class MediaListenerService : NotificationListenerService() {
         return bmp
     }
 
-    private fun compressToSafeBaselineJpeg(bitmap: Bitmap): ByteArray? {
+    private fun compressToSafeBaselineJpeg(bitmap: Bitmap, targetBytes: Int = 20480): ByteArray? {
         var quality = 65
         var stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
         var bytes = stream.toByteArray()
 
-        while (bytes.size > 20480 && quality > 10) {
+        while (bytes.size > targetBytes && quality > 10) {
             quality = maxOf(10, quality - 10)
             stream = ByteArrayOutputStream()
             bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
             bytes = stream.toByteArray()
         }
-        // 品質10まで下げても上限を超える場合は画像を送らない。
-        // ESP側の受信上限 (24,576B) を超えると静かに読み捨てられるため、
+        // 品質10まで下げても目標サイズを超える場合は画像を送らない。
+        // 大きすぎる画像は ESP 側で受信が完走しない/読み捨てられるため、
         // null を返してメタデータのみ送信する形にする。
-        if (bytes.size > 20480) return null
+        if (bytes.size > targetBytes) return null
         return bytes
     }
 }
