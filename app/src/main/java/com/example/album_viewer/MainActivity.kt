@@ -108,6 +108,8 @@ fun MainScreen() {
     var selectedDevice by remember { mutableStateOf<BluetoothDevice?>(null) }
     var dropdownExpanded by remember { mutableStateOf(false) }
 
+    var assistantName by remember { mutableStateOf(AppSettings.getAssistantName(context)) }
+
     LaunchedEffect(hasBtPermission) {
         if (hasBtPermission && bluetoothAdapter != null) {
             pairedDevices = bluetoothAdapter.bondedDevices.toList()
@@ -292,6 +294,41 @@ fun MainScreen() {
                     ) {
                         Text("切断")
                     }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("表示設定", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Muse の承認リクエスト通知を ESP32 に表示するとき、見出し「◯◯が承認を求めています！！」に使う名前です。空欄の場合は通知文からの自動抽出を試み、取れなければ原文のまま表示します。",
+                    fontSize = 12.sp,
+                    color = Color.Gray
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = assistantName,
+                    onValueChange = { assistantName = it },
+                    label = { Text("アシスタント名") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        AppSettings.setAssistantName(context, assistantName)
+                        Toast.makeText(context, "保存しました", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("保存")
                 }
             }
         }
