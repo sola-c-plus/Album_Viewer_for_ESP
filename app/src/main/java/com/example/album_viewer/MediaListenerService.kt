@@ -16,6 +16,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
@@ -79,6 +80,12 @@ class MediaListenerService : NotificationListenerService() {
     private val isSweepingNotifications = AtomicBoolean(false)
 
     private var lastRawArtwork: Bitmap? = null
+
+    // 現在 ESP に表示されている画像（曲アート送信時の squareBmp、またはスタンバイ
+    // ダッシュボード）。ポップアップの背景にはこちらを使い、時計表示中に前の曲の
+    // ジャケットが背景になるのを防ぐ。保持は 240×240 を1枚だけ参照する形にする。
+    @Volatile
+    private var lastDisplayedBitmap: Bitmap? = null
 
     private var stopDetectionTimestamp: Long = 0L
     private var isStandbyScreenActive = false
@@ -340,7 +347,9 @@ class MediaListenerService : NotificationListenerService() {
                 popupDismissJob?.cancel()
 
                 val popupBitmap = drawNotificationPopupOnBitmap(
-                    baseBitmap = lastRawArtwork,
+                    // 背景は「現在表示中の画像」を優先する（スタンバイ中なら時計画面）。
+                    // まだ何も表示していない場合だけ最後の曲アートにフォールバックする。
+                    baseBitmap = lastDisplayedBitmap ?: lastRawArtwork,
                     appName = appName,
                     title = title.ifBlank { appName },
                     text = text.ifBlank { "新しい通知があります" },
@@ -485,6 +494,7 @@ class MediaListenerService : NotificationListenerService() {
                         MediaStateHolder.updateTrack(trackInfo.title, trackInfo.artist, trackInfo.album, trackInfo.packageName, squareBmp, jpegBytes)
                     }
 
+                    lastDisplayedBitmap = squareBmp
                     BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes, rgb565Accent, rgb565Bg)
                     Log.d(TAG, "Sent Track Art: ${trackInfo.title} (hasArt=$hasArt)")
 
@@ -556,6 +566,7 @@ class MediaListenerService : NotificationListenerService() {
             MediaStateHolder.updateTrack(title, artist, "", "System Standby", dashboardBmp, jpegBytes)
         }
 
+        lastDisplayedBitmap = dashboardBmp
         BluetoothSppManager.sendMediaPacket(title, artist, "", jpegBytes, defaultCyanRgb565, blackBgRgb565)
     }
 
@@ -1114,7 +1125,10 @@ class MediaListenerService : NotificationListenerService() {
             canvas.drawColor(Color.rgb(18, 20, 28))
         }
 
-        val cardRect = RectF(16f, 22f, 224f, 158f)
+        // 円形ディスプレイ (GC9A01) の内側に収まるよう、カードはコンテンツ幅
+        // 168px (x=36..204) に収め、上下も円の幅が狭くなる領域 (y<36 / y>204)
+        // にかからない範囲に配置する。
+        val cardRect = RectF(36f, 36f, 204f, 172f)
         val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(225, 25, 27, 36)
             style = Paint.Style.FILL
@@ -1127,12 +1141,12 @@ class MediaListenerService : NotificationListenerService() {
         canvas.drawRoundRect(cardRect, 18f, 18f, cardPaint)
         canvas.drawRoundRect(cardRect, 18f, 18f, borderPaint)
 
-        val headerY = 46f
-        var textStartX = 30f
+        val headerY = 60f
+        var textStartX = 50f
         if (appIcon != null) {
             val iconScaled = Bitmap.createScaledBitmap(appIcon, 20, 20, true)
-            canvas.drawBitmap(iconScaled, 28f, headerY - 15f, null)
-            textStartX = 54f
+            canvas.drawBitmap(iconScaled, 48f, headerY - 15f, null)
+            textStartX = 74f
         }
 
         val appNamePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1147,22 +1161,36 @@ class MediaListenerService : NotificationListenerService() {
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
         }
-        val safeTitle = ellipsizeText(title, titlePaint, 175f)
-        canvas.drawText(safeTitle, 28f, 76f, titlePaint)
+        val safeTitle = ellipsizeText(title, titlePaint, 144f)
+        canvas.drawText(safeTitle, 48f, 90f, titlePaint)
 
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(215, 220, 235)
             textSize = 12f
             typeface = Typeface.DEFAULT
         }
-        val safeText1 = ellipsizeText(text, textPaint, 175f)
-        canvas.drawText(safeText1, 28f, 102f, textPaint)
+        val safeText1 = ellipsizeText(text, textPaint, 144f)
+        canvas.drawText(safeText1, 48f, 116f, textPaint)
 
         val remaining = text.drop(safeText1.length).trim()
         if (remaining.isNotEmpty()) {
-            val safeText2 = ellipsizeText(remaining, textPaint, 175f)
-            canvas.drawText(safeText2, 28f, 122f, textPaint)
+            val safeText2 = ellipsizeText(remaining, textPaint, 144f)
+            canvas.drawText(safeText2, 48f, 136f, textPaint)
         }
+
+        // 円形ディスプレイ (GC9A01, 240×240) に合わせ、中心円 (半径120) の外側を
+        // 黒で落とす。RGB_565 にはアルファが無いため、円の外側を塗りつぶす方式にする。
+        val center = targetSize / 2f
+        val outsideCirclePath = Path().apply {
+            fillType = Path.FillType.EVEN_ODD
+            addRect(0f, 0f, targetSize.toFloat(), targetSize.toFloat(), Path.Direction.CW)
+            addCircle(center, center, center, Path.Direction.CW)
+        }
+        val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.BLACK
+            style = Paint.Style.FILL
+        }
+        canvas.drawPath(outsideCirclePath, maskPaint)
 
         return result
     }
