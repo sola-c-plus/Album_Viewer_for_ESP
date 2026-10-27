@@ -1313,9 +1313,12 @@ class MediaListenerService : NotificationListenerService() {
             textSize = 12f
             typeface = Typeface.DEFAULT
         }
-        // 本文は最大4行まで折り返す。各行の最大幅は、その行の帯における
+        // 本文は最大5行まで折り返す。各行の最大幅は、その行の帯における
         // 円 (半径108) の弦幅から余白 16px を引いたものにする。
-        val bodyLineYs = floatArrayOf(104f, 124f, 144f, 164f)
+        // 5行目 (baseline 184) の帯の下端は約188で、カード下端 (228) にも
+        // ESP 側ドック表示の開始位置 (y=194) にも届かない。弦幅も約158px
+        // あり、本文 12px でも実用になる (実機で重なり無しを確認済み)。
+        val bodyLineYs = floatArrayOf(104f, 124f, 144f, 164f, 184f)
         val bodyLineWidths = bodyLineYs.map { y ->
             circleLineMaxWidth(center, cardRadius, y, textPaint.textSize)
         }
