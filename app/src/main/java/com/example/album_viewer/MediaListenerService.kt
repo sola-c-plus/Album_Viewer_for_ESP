@@ -75,6 +75,8 @@ class MediaListenerService : NotificationListenerService() {
     private var currentPackage = ""
     private var lastSentTrackSignature = ""
     private var isShowingNotificationPopup = false
+    private var isFirstListenerConnection = true
+    private val isSweepingNotifications = AtomicBoolean(false)
 
     private var lastRawArtwork: Bitmap? = null
 
@@ -160,6 +162,15 @@ class MediaListenerService : NotificationListenerService() {
             }
         }
 
+        if (isFirstListenerConnection) {
+            // 初回接続時は既存の通知を一斉にポップアップさせないよう、処理済み登録だけ行う
+            isFirstListenerConnection = false
+            primeExistingNotifications()
+        } else {
+            // 再接続時は、未接続の隙間にポストされた未処理の通知を拾う
+            sweepMissedNotifications()
+        }
+
         startMonitoringLoop()
     }
 
@@ -231,6 +242,47 @@ class MediaListenerService : NotificationListenerService() {
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
         triggerUpdateWithDebounce(200)
+    }
+
+    /**
+     * 通知シェード全体を走査し、onNotificationPosted で取りこぼした通知を拾う。
+     * 対象判定と重複防止は shouldShowNotificationPopup / handledNotificationKeys をそのまま再利用する。
+     * リスナー未接続の隙間や再接続直後にポストされた通知が対象。
+     */
+    private fun sweepMissedNotifications() {
+        if (isShowingNotificationPopup) return
+        if (!isSweepingNotifications.compareAndSet(false, true)) return
+        try {
+            val notifications = activeNotifications ?: return
+            for (sbn in notifications) {
+                if (isShowingNotificationPopup) break
+                if (shouldShowNotificationPopup(sbn)) {
+                    Log.d(TAG, "Sweep picked up missed notification: ${sbn.packageName}")
+                    handleNotificationPopup(sbn)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in sweepMissedNotifications", e)
+        } finally {
+            isSweepingNotifications.set(false)
+        }
+    }
+
+    /**
+     * 初回接続時に、既に通知シェードにある通知を「処理済み」として登録だけする。
+     * shouldShowNotificationPopup は true を返す対象について handledNotificationKeys へ
+     * キーを登録するため、戻り値を捨てて呼び出すことで古い通知の一斉ポップアップを防ぐ。
+     */
+    private fun primeExistingNotifications() {
+        try {
+            val notifications = activeNotifications ?: return
+            for (sbn in notifications) {
+                shouldShowNotificationPopup(sbn)
+            }
+            Log.d(TAG, "Primed ${notifications.size} existing notifications on first connection")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to prime existing notifications", e)
+        }
     }
 
     private fun shouldShowNotificationPopup(sbn: StatusBarNotification): Boolean {
@@ -350,6 +402,7 @@ class MediaListenerService : NotificationListenerService() {
                 delay(1000)
                 if (!isShowingNotificationPopup) {
                     updateActiveMedia()
+                    sweepMissedNotifications()
                 }
             }
         }
