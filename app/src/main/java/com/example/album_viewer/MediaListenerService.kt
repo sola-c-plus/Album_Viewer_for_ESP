@@ -247,7 +247,8 @@ class MediaListenerService : NotificationListenerService() {
                           pkg.contains("messaging") || pkg.contains("mms") ||
                           pkg.contains("twitter") || pkg.contains("instagram") ||
                           pkg.contains("slack") || pkg.contains("whatsapp") ||
-                          pkg.contains("gmail") || pkg.contains("mail")
+                          pkg.contains("gmail") || pkg.contains("mail") ||
+                          pkg.contains("facebook.aura")
 
         if (!isTargetApp) return false
 
@@ -1108,6 +1109,7 @@ class MediaListenerService : NotificationListenerService() {
             packageName.contains("slack") -> "Slack"
             packageName.contains("messaging") || packageName.contains("mms") -> "メッセージ"
             packageName.contains("whatsapp") -> "WhatsApp"
+            packageName.contains("facebook.aura") -> "Muse"
             else -> "通知"
         }
     }
@@ -1122,6 +1124,7 @@ class MediaListenerService : NotificationListenerService() {
             packageName.contains("gm") || packageName.contains("mail") -> Color.rgb(234, 67, 53)
             packageName.contains("slack") -> Color.rgb(74, 21, 75)
             packageName.contains("whatsapp") -> Color.rgb(37, 211, 102)
+            packageName.contains("facebook.aura") -> Color.rgb(139, 92, 246)
             else -> Color.rgb(0, 210, 255)
         }
     }
