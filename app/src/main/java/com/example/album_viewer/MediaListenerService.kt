@@ -92,6 +92,7 @@ class MediaListenerService : NotificationListenerService() {
     private var isStandbyScreenActive = false
     private var lastSentMinute = -1
     private var lastSentBatteryPct = -1
+    private var lastSentStandbySignature = ""
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         registerControllerCallbacks(controllers)
@@ -164,6 +165,7 @@ class MediaListenerService : NotificationListenerService() {
                     currentPackage = ""
                     lastSentTrackSignature = ""
                     lastSentMinute = -1
+                    lastSentStandbySignature = ""
                     stopDetectionTimestamp = 0L
                     triggerUpdateDirect()
                 }
@@ -381,6 +383,7 @@ class MediaListenerService : NotificationListenerService() {
                     isStandbyScreenActive = false
                     stopDetectionTimestamp = 0L
                     lastSentTrackSignature = ""
+                    lastSentStandbySignature = ""
                     triggerUpdateDirect()
                 }
             } catch (e: CancellationException) {
@@ -394,6 +397,7 @@ class MediaListenerService : NotificationListenerService() {
                 isStandbyScreenActive = false
                 stopDetectionTimestamp = 0L
                 lastSentTrackSignature = ""
+                lastSentStandbySignature = ""
                 triggerUpdateDirect()
             }
         }
@@ -470,6 +474,7 @@ class MediaListenerService : NotificationListenerService() {
             if (isMusicActuallyPlaying && trackInfo != null) {
                 stopDetectionTimestamp = 0L
                 isStandbyScreenActive = false
+                lastSentStandbySignature = ""
 
                 val hasArt = (trackInfo.bitmap != null)
                 val artSignature = trackInfo.bitmap?.let { "${it.width}x${it.height}_${it.generationId}_${it.allocationByteCount}" } ?: "no_art"
@@ -555,6 +560,22 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     private suspend fun sendStandbyDashboard(cal: Calendar, batteryPct: Int, isCharging: Boolean) {
+        // 同一内容（分・電池%・充電状態）の二重送信を防ぐ署名ガード（唯一の送信チョークポイント）。
+        // 接続リセットやポップアップ解除による再遷移と、分切り替わりの再送分岐が重なっても、
+        // 内容が同じなら実際に送るのは1回だけにする。
+        // 署名は「復帰送信が前提のリセット経路」（ポップアップ解除・再接続・再生開始）で
+        // クリアする。クリア後の復帰送信は1回だけ通って署名が再記録されるため、
+        // 競合する2回目は引き続き抑止できる。逆にクリアしないと、復帰送信自体が
+        // 同一内容として抑止され、ポップアップ画像や曲アートが次の分境界まで
+        // ESP に残ってしまう。
+        val signature = "${cal.get(Calendar.DAY_OF_YEAR)}_${cal.get(Calendar.HOUR_OF_DAY)}_" +
+            "${cal.get(Calendar.MINUTE)}_${batteryPct}_$isCharging"
+        if (signature == lastSentStandbySignature) {
+            Log.d(TAG, "Skip duplicate standby dashboard: $signature")
+            return
+        }
+        lastSentStandbySignature = signature
+
         val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240)
         val jpegBytes = compressToSafeBaselineJpeg(dashboardBmp)
 
