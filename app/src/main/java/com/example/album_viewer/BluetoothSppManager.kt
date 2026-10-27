@@ -29,6 +29,8 @@ enum class ConnectionStatus {
 
 object BluetoothSppManager {
     private const val TAG = "BluetoothSppManager"
+    private const val IMAGE_ACK_TIMEOUT_MS = 3000L
+    private const val MAX_IMAGE_RESEND = 1
     private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
     private val _connectionStatus = MutableStateFlow(ConnectionStatus.DISCONNECTED)
@@ -43,6 +45,25 @@ object BluetoothSppManager {
     private var receiveJob: Job? = null
     private var reconnectJob: Job? = null
     private var activeSendJob: Job? = null
+
+    // ★ 画像 ACK＋再送プロトコル (type 0x05): 最新の画像送信を1件だけ記録する
+    private class ImageSendRecord(
+        val seq: Long,
+        val title: String,
+        val artist: String,
+        val album: String,
+        val jpegBytes: ByteArray,
+        val rgb565Color: Int,
+        val rgb565BgColor: Int,
+        val checksum: Int
+    ) {
+        var resendCount: Int = 0
+        var acked: Boolean = false
+    }
+
+    @Volatile
+    private var latestImageSend: ImageSendRecord? = null
+    private var imageSendSeq = 0L
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
@@ -145,6 +166,7 @@ object BluetoothSppManager {
         socket = null
         outputStream = null
         inputStream = null
+        latestImageSend = null
     }
 
     private fun triggerAutoReconnect() {
@@ -237,6 +259,80 @@ object BluetoothSppManager {
             Log.d(TAG, "Media Control Command: 0x%02X".format(cmd))
             onCommandReceived?.invoke(cmd)
         }
+        if (type == 0x05.toByte()) {
+            handleImageAck(payload)
+        }
+    }
+
+    // ★ ESP と同一の定義: ペイロード全バイトを符号なしで加算した値 (Int のオーバーフローで uint32 相当)
+    private fun computeImageChecksum(bytes: ByteArray): Int {
+        var sum = 0
+        for (b in bytes) {
+            sum += b.toInt() and 0xFF
+        }
+        return sum
+    }
+
+    // ★ 画像 ACK (type 0x05): [0]=ステータス (0x01=OK / 0x00=NG), [1..4]=受信側チェックサム (BE)
+    private fun handleImageAck(payload: ByteArray) {
+        if (payload.size != 5) {
+            Log.w(TAG, "Invalid image ACK payload size: ${payload.size}")
+            return
+        }
+        val status = payload[0].toInt() and 0xFF
+        val ackChecksum = ((payload[1].toInt() and 0xFF) shl 24) or
+                ((payload[2].toInt() and 0xFF) shl 16) or
+                ((payload[3].toInt() and 0xFF) shl 8) or
+                (payload[4].toInt() and 0xFF)
+        val record = latestImageSend ?: return
+        if (status == 0x01) {
+            if (ackChecksum == record.checksum) {
+                synchronized(record) { record.acked = true }
+                Log.d(TAG, "Image ACK OK: seq=${record.seq} csum=%08X".format(record.checksum))
+            } else {
+                Log.w(TAG, "Image ACK csum mismatch: seq=${record.seq} ack=%08X sent=%08X".format(ackChecksum, record.checksum))
+            }
+        } else {
+            Log.w(TAG, "Image ACK NG: seq=${record.seq} received csum=%08X".format(ackChecksum))
+            requestImageResend(record, "ACK NG")
+        }
+    }
+
+    // ★ 送信完了から IMAGE_ACK_TIMEOUT_MS 経っても ACK が無ければ再送を試みる
+    private fun scheduleImageAckWatch(seq: Long, allowResend: Boolean) {
+        scope.launch {
+            delay(IMAGE_ACK_TIMEOUT_MS)
+            val record = latestImageSend ?: return@launch
+            if (record.seq != seq || record.acked) return@launch
+            if (_connectionStatus.value != ConnectionStatus.CONNECTED) return@launch
+            if (allowResend) {
+                requestImageResend(record, "ACK timeout")
+            } else {
+                Log.w(TAG, "Image ACK not received after resend, giving up: seq=$seq")
+            }
+        }
+    }
+
+    // ★ 最新 seq の画像を最大 MAX_IMAGE_RESEND 回だけ再送する (通常送信のキャンセル管理には干渉しない)
+    private fun requestImageResend(record: ImageSendRecord, reason: String) {
+        if (latestImageSend !== record) return
+        if (_connectionStatus.value != ConnectionStatus.CONNECTED) return
+        synchronized(record) {
+            if (record.acked || record.resendCount >= MAX_IMAGE_RESEND) return
+            record.resendCount++
+        }
+        Log.d(TAG, "Resending image: seq=${record.seq} reason=$reason")
+        scope.launch {
+            sendPacketBody(
+                record.title,
+                record.artist,
+                record.album,
+                record.jpegBytes,
+                record.rgb565Color,
+                record.rgb565BgColor,
+                resendOfSeq = record.seq
+            )
+        }
     }
 
     /**
@@ -285,7 +381,8 @@ object BluetoothSppManager {
         album: String,
         jpegBytes: ByteArray?,
         rgb565Color: Int,
-        rgb565BgColor: Int
+        rgb565BgColor: Int,
+        resendOfSeq: Long? = null
     ) {
         if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return
 
@@ -311,6 +408,23 @@ object BluetoothSppManager {
 
                 // 2. JPEGパケット送信 (チャンク256B, flushはループ完了後に1回のみ)
                 if (jpegBytes != null && jpegBytes.isNotEmpty() && currentCoroutineContext().isActive) {
+                    // ★ ACK 監視用に今回の送信を記録する (再送時は既存の記録を引き継ぎ、新規 seq は振らない)
+                    val sendRecord: ImageSendRecord? = if (resendOfSeq == null) {
+                        val rec = ImageSendRecord(
+                            seq = ++imageSendSeq,
+                            title = title,
+                            artist = artist,
+                            album = album,
+                            jpegBytes = jpegBytes,
+                            rgb565Color = rgb565Color,
+                            rgb565BgColor = rgb565BgColor,
+                            checksum = computeImageChecksum(jpegBytes)
+                        )
+                        latestImageSend = rec
+                        rec
+                    } else {
+                        latestImageSend?.takeIf { it.seq == resendOfSeq }
+                    }
                     val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
                     val sendStartMs = System.currentTimeMillis()
                     var offset = 0
@@ -325,6 +439,10 @@ object BluetoothSppManager {
                         out.flush()
                         val elapsedMs = System.currentTimeMillis() - sendStartMs
                         Log.d(TAG, "Image sent: ${imgPacket.size} bytes in $elapsedMs ms")
+                        // ★ ESP からの画像 ACK (type 0x05) を監視する
+                        if (sendRecord != null) {
+                            scheduleImageAckWatch(sendRecord.seq, allowResend = resendOfSeq == null)
+                        }
                     }
                 }
             } catch (e: Exception) {
