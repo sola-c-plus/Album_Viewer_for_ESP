@@ -70,7 +70,11 @@ class MediaListenerService : NotificationListenerService() {
 
     private val activeControllers = ConcurrentHashMap<MediaController, MediaController.Callback>()
     private val handledNotificationKeys = LruCache<String, Long>(300)
-    private val artworkCache = LruCache<String, Bitmap>(30)
+    // 容量は件数ではなくバイト基準（上限12MB）。実寸 Bitmap を多数保持して
+    // 低メモリ時のプロセス kill を誘発しないよう、sizeOf で byteCount を数える。
+    private val artworkCache = object : LruCache<String, Bitmap>(12 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
 
     private var currentTitle = ""
     private var currentArtist = ""
@@ -694,6 +698,20 @@ class MediaListenerService : NotificationListenerService() {
         val lastUpdateTime: Long
     )
 
+    /**
+     * キャッシュ保持用に、長辺512px超の Bitmap は512px以下へ縮小したコピーを返す。
+     * 表示は 240×240 のため画質への影響はない。元の Bitmap 自体は変更しない
+     * （lastRawArtwork 等は元の参照のまま使う）。
+     */
+    private fun downscaleForArtworkCache(bitmap: Bitmap): Bitmap {
+        val maxEdge = maxOf(bitmap.width, bitmap.height)
+        if (maxEdge <= 512) return bitmap
+        val scale = 512f / maxEdge
+        val newWidth = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val newHeight = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+    }
+
     private fun detectCurrentActiveTrack(): TrackInfo? {
         val candidates = mutableListOf<TrackInfo>()
         val notifications = activeNotifications ?: emptyArray()
@@ -742,7 +760,7 @@ class MediaListenerService : NotificationListenerService() {
                         }
 
                         if (bitmap != null) {
-                            artworkCache.put(cacheKey, bitmap)
+                            artworkCache.put(cacheKey, downscaleForArtworkCache(bitmap))
                         }
                     }
 
@@ -780,7 +798,7 @@ class MediaListenerService : NotificationListenerService() {
                             bitmap = extractArtworkFromNotification(extras, notif)
                                 ?: findLocalArtworkByMediaStore(title, artist)
                             if (bitmap != null) {
-                                artworkCache.put(cacheKey, bitmap)
+                                artworkCache.put(cacheKey, downscaleForArtworkCache(bitmap))
                             }
                         }
                         candidates.add(TrackInfo(title, artist, album, bitmap, pkg, isPlaying, postTime))
