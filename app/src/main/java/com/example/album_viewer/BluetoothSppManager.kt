@@ -44,6 +44,20 @@ object BluetoothSppManager {
     // NG 再送前の待ち時間。ESP が受信タイムアウトでリセットした直後はリンクが
     // 落ち着かないことがあるため、少し間を空けてから再送する。
     private const val NG_RESEND_BACKOFF_MS = 400L
+    // 画像チャンク送信のペーシング (チャンク 256B は PR #13 で導入)。
+    // ESP32 (WROOM-32E) はヒープが小さく (実測: 空き約42KB・最大連続ブロック
+    // 約27KB)、Bluetooth スタックの受信バッファに余裕がない。10ms 間隔でも
+    // 97B の META が 53/97B、4,535B の画像が 3,118/4,535B で転送が止まる
+    // 事象が続いたため (2026-10-27 実機、ESP 側リング溢れはゼロ = 経路での
+    // 欠落)、間隔を 25ms に広げて ESP 受信側のヒープ/スタックに余力を作る。
+    private const val IMAGE_CHUNK_SIZE = 256
+    private const val IMAGE_CHUNK_INTERVAL_MS = 25L
+    // パケット間の静穏期間。前パケットの書き込み完了から最低この時間が
+    // 経つまで次パケットを書き始めない。ESP がデコード・描画を終えて
+    // ヒープ/スタックの余裕を取り戻す時間を確保する。NG 再送前の
+    // NG_RESEND_BACKOFF_MS とは別に、全パケット (META・画像・スタンバイ・
+    // 再送) へ一律に効かせる (両方効いて長めに待っても害はない)。
+    private const val PACKET_QUIET_PERIOD_MS = 400L
     private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
     private val _connectionStatus = MutableStateFlow(ConnectionStatus.DISCONNECTED)
@@ -107,6 +121,11 @@ object BluetoothSppManager {
     private val gson = Gson()
     private val sendMutex = Mutex()
     private val connectMutex = Mutex()
+
+    // 直近パケットの書き込み完了時刻。パケット間の静穏期間の起点として使う。
+    // 読み書きは sendPacketBody 内で sendMutex を保持しているときだけ行う
+    // ため、追加の同期は不要。
+    private var lastPacketCompletedAtMs = 0L
 
     private var targetDevice: BluetoothDevice? = null
     private var isAutoReconnectActive = true
@@ -595,6 +614,21 @@ object BluetoothSppManager {
                     }
                 }
 
+                // 静穏期間: 前パケットの書き込み完了から PACKET_QUIET_PERIOD_MS
+                // 経つまでは書き始めない。sendMutex を握ったまま待つことで他
+                // パケットの割り込みを防ぎ、直列化を保つ (待つのは上記の各種
+                // ガードを全て通過したパケットだけ)。待ちの間にキャンセル
+                // された場合は delay が CancellationException を投げて catch
+                // 側で静かに終了する (何も書かない)。切断→再接続でストリーム
+                // が入れ替わっていた場合も、古い内容を書かないよう再確認する。
+                if (lastPacketCompletedAtMs > 0L) {
+                    val quietElapsedMs = System.currentTimeMillis() - lastPacketCompletedAtMs
+                    if (quietElapsedMs < PACKET_QUIET_PERIOD_MS) {
+                        delay(PACKET_QUIET_PERIOD_MS - quietElapsedMs)
+                        if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream !== out) return@withLock
+                    }
+                }
+
                 // 1. メタデータ送信
                 val metadataMap = mapOf(
                     "title" to title,
@@ -617,7 +651,8 @@ object BluetoothSppManager {
 
                     delay(100)
 
-                    // 2. JPEGパケット送信 (チャンク256B, flushはループ完了後に1回のみ)
+                    // 2. JPEGパケット送信 (チャンク IMAGE_CHUNK_SIZE、間隔
+                    // IMAGE_CHUNK_INTERVAL_MS、flushはループ完了後に1回のみ)
                     if (jpegBytes != null && jpegBytes.isNotEmpty()) {
                         // ★ ACK 監視用に今回の送信を保留キューへ記録する
                         // (再送時は既存のレコードを引き継ぎ、新規 seq は振らない)
@@ -640,12 +675,11 @@ object BluetoothSppManager {
                         val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
                         val sendStartMs = System.currentTimeMillis()
                         var offset = 0
-                        val chunkSize = 256
                         while (offset < imgPacket.size) {
-                            val len = minOf(chunkSize, imgPacket.size - offset)
+                            val len = minOf(IMAGE_CHUNK_SIZE, imgPacket.size - offset)
                             out.write(imgPacket, offset, len)
                             offset += len
-                            if (offset < imgPacket.size) delay(10)
+                            if (offset < imgPacket.size) delay(IMAGE_CHUNK_INTERVAL_MS)
                         }
                         out.flush()
                         val elapsedMs = System.currentTimeMillis() - sendStartMs
@@ -656,6 +690,10 @@ object BluetoothSppManager {
                         }
                     }
                 }
+
+                // 静穏期間の起点として、このパケットの書き込み完了時刻を記録
+                // する (メタデータのみのパケットも含め全パケットが対象)。
+                lastPacketCompletedAtMs = System.currentTimeMillis()
             } catch (e: Exception) {
                 if (e !is CancellationException) {
                     Log.e(TAG, "Failed to send media packet: ${e.message}")
