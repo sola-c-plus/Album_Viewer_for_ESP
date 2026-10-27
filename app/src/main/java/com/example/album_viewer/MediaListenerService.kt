@@ -18,7 +18,6 @@ import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Icon
@@ -50,6 +49,8 @@ import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
+import kotlin.math.sqrt
 
 class MediaListenerService : NotificationListenerService() {
 
@@ -375,7 +376,7 @@ class MediaListenerService : NotificationListenerService() {
                 BluetoothSppManager.sendMediaPacketQueued(displayTitle, displayArtist, "", jpegBytes, rgb565Color, rgb565Bg)
 
                 popupDismissJob = launch {
-                    delay(5000)
+                    delay(10000)
                     isShowingNotificationPopup = false
                     isStandbyScreenActive = false
                     stopDetectionTimestamp = 0L
@@ -1125,10 +1126,11 @@ class MediaListenerService : NotificationListenerService() {
             canvas.drawColor(Color.rgb(18, 20, 28))
         }
 
-        // 円形ディスプレイ (GC9A01) の内側に収まるよう、カードはコンテンツ幅
-        // 168px (x=36..204) に収め、上下も円の幅が狭くなる領域 (y<36 / y>204)
-        // にかからない範囲に配置する。
-        val cardRect = RectF(36f, 36f, 204f, 172f)
+        // 円形ディスプレイ (GC9A01) に合わせ、カード自体もディスプレイと同心の
+        // 円形 (中心 120,120・半径 108) にする。テキストは各行の y における円の
+        // 弦幅に収まる範囲へ配置する。
+        val center = targetSize / 2f
+        val cardRadius = 108f
         val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(225, 25, 27, 36)
             style = Paint.Style.FILL
@@ -1138,15 +1140,15 @@ class MediaListenerService : NotificationListenerService() {
             style = Paint.Style.STROKE
             strokeWidth = 2.5f
         }
-        canvas.drawRoundRect(cardRect, 18f, 18f, cardPaint)
-        canvas.drawRoundRect(cardRect, 18f, 18f, borderPaint)
+        canvas.drawCircle(center, center, cardRadius, cardPaint)
+        canvas.drawCircle(center, center, cardRadius, borderPaint)
 
-        val headerY = 60f
-        var textStartX = 50f
+        val headerY = 64f
+        var textStartX = 46f
         if (appIcon != null) {
             val iconScaled = Bitmap.createScaledBitmap(appIcon, 20, 20, true)
-            canvas.drawBitmap(iconScaled, 48f, headerY - 15f, null)
-            textStartX = 74f
+            canvas.drawBitmap(iconScaled, 46f, headerY - 15f, null)
+            textStartX = 72f
         }
 
         val appNamePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1161,26 +1163,29 @@ class MediaListenerService : NotificationListenerService() {
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
         }
-        val safeTitle = ellipsizeText(title, titlePaint, 144f)
-        canvas.drawText(safeTitle, 48f, 90f, titlePaint)
+        val titleMaxWidth = 176f
+        val safeTitle = ellipsizeText(title, titlePaint, titleMaxWidth)
+        canvas.drawText(safeTitle, center - titleMaxWidth / 2f, 94f, titlePaint)
 
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(215, 220, 235)
             textSize = 12f
             typeface = Typeface.DEFAULT
         }
-        val safeText1 = ellipsizeText(text, textPaint, 144f)
-        canvas.drawText(safeText1, 48f, 116f, textPaint)
-
-        val remaining = text.drop(safeText1.length).trim()
-        if (remaining.isNotEmpty()) {
-            val safeText2 = ellipsizeText(remaining, textPaint, 144f)
-            canvas.drawText(safeText2, 48f, 136f, textPaint)
+        // 本文は最大4行まで折り返す。各行の最大幅は、その行の帯における
+        // 円 (半径108) の弦幅から余白 16px を引いたものにする。
+        val bodyLineYs = floatArrayOf(118f, 138f, 158f, 178f)
+        val bodyLineWidths = bodyLineYs.map { y ->
+            circleLineMaxWidth(center, cardRadius, y, textPaint.textSize)
+        }
+        val bodyLines = wrapTextIntoLines(text, textPaint, bodyLineWidths)
+        bodyLines.forEachIndexed { index, line ->
+            val lineWidth = bodyLineWidths[index]
+            canvas.drawText(line, center - lineWidth / 2f, bodyLineYs[index], textPaint)
         }
 
         // 円形ディスプレイ (GC9A01, 240×240) に合わせ、中心円 (半径120) の外側を
         // 黒で落とす。RGB_565 にはアルファが無いため、円の外側を塗りつぶす方式にする。
-        val center = targetSize / 2f
         val outsideCirclePath = Path().apply {
             fillType = Path.FillType.EVEN_ODD
             addRect(0f, 0f, targetSize.toFloat(), targetSize.toFloat(), Path.Direction.CW)
@@ -1202,6 +1207,48 @@ class MediaListenerService : NotificationListenerService() {
             len--
         }
         return text.take(len) + "..."
+    }
+
+    // 円 (中心 center, 半径 radius) の内側で、baseline のテキスト行が使える最大幅。
+    // 行の帯 (baseline - textSize .. baseline) のうち円中心から最も遠い端の y で
+    // 弦幅を求め、余白として 16px を引く。
+    private fun circleLineMaxWidth(center: Float, radius: Float, baseline: Float, textSize: Float): Float {
+        val dy = maxOf(abs(baseline - textSize - center), abs(baseline - center))
+        if (dy >= radius) return 0f
+        val halfChord = sqrt(radius * radius - dy * dy)
+        return 2f * halfChord - 16f
+    }
+
+    // テキストを lineWidths の各行幅で折り返し、最大 lineWidths.size 行まで返す。
+    // 最終行までに収まらない分は最終行を省略記号で切り詰める。
+    private fun wrapTextIntoLines(text: String, paint: Paint, lineWidths: List<Float>): List<String> {
+        val normalized = text.replace('\n', ' ').replace('\r', ' ')
+        val lines = mutableListOf<String>()
+        var rest = normalized
+        for ((index, maxWidth) in lineWidths.withIndex()) {
+            if (rest.isEmpty()) break
+            if (paint.measureText(rest) <= maxWidth) {
+                lines.add(rest)
+                rest = ""
+                break
+            }
+            if (index == lineWidths.lastIndex) {
+                lines.add(ellipsizeText(rest, paint, maxWidth))
+                rest = ""
+                break
+            }
+            var count = paint.breakText(rest, 0, rest.length, true, maxWidth, null)
+            // サロゲートペア (絵文字等) の途中で折らないよう1文字戻す
+            if (count in 1 until rest.length &&
+                Character.isHighSurrogate(rest[count - 1]) && Character.isLowSurrogate(rest[count])
+            ) {
+                count--
+            }
+            if (count <= 0) break
+            lines.add(rest.substring(0, count))
+            rest = rest.substring(count).trimStart()
+        }
+        return lines
     }
 
     private fun getAppDisplayName(packageName: String): String {
