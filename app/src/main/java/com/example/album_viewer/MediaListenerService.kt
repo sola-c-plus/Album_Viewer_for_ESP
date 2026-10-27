@@ -159,6 +159,10 @@ class MediaListenerService : NotificationListenerService() {
                     lastSentMinute = -1
                     stopDetectionTimestamp = 0L
                     triggerUpdateDirect()
+                } else {
+                    // 切断/エラー中は曲署名を保持しない。再接続後に必ず再送されるようにする。
+                    // （未接続の間に「送信済み」だけ進んで表示が固定されるのを防ぐ）
+                    lastSentTrackSignature = ""
                 }
             }
         }
@@ -474,7 +478,12 @@ class MediaListenerService : NotificationListenerService() {
                 val isNewTrackOrArtUpdated = (trackSignature != lastSentTrackSignature)
 
                 if (isNewTrackOrArtUpdated) {
-                    lastSentTrackSignature = trackSignature
+                    // 署名の更新は接続中の場合に限る。未接続時に先行更新すると、
+                    // 無言の送信失敗のまま「送信済み」となり、その曲の間ずっと
+                    // ESP の表示が前の曲のまま固定されてしまう。
+                    if (BluetoothSppManager.connectionStatus.value == ConnectionStatus.CONNECTED) {
+                        lastSentTrackSignature = trackSignature
+                    }
                     currentTitle = trackInfo.title
                     currentArtist = trackInfo.artist
                     currentPackage = trackInfo.packageName
