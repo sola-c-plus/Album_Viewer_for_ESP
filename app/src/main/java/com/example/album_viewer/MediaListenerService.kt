@@ -84,6 +84,7 @@ class MediaListenerService : NotificationListenerService() {
     private var isStandbyScreenActive = false
     private var lastSentMinute = -1
     private var lastSentBatteryPct = -1
+    private var lastSentStandbySignature = ""
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         registerControllerCallbacks(controllers)
@@ -544,6 +545,19 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     private suspend fun sendStandbyDashboard(cal: Calendar, batteryPct: Int, isCharging: Boolean) {
+        // 同一内容（分・電池%・充電状態）の二重送信を防ぐ署名ガード（唯一の送信チョークポイント）。
+        // 接続リセットやポップアップ解除による再遷移と、分切り替わりの再送分岐が重なっても、
+        // 内容が同じなら実際に送るのは1回だけにする。
+        // この署名はリセット経路（接続コレクタ／ポップアップ解除）ではクリアしない。
+        // クリアすると二重送信ガードそのものが無効化されるため。
+        val signature = "${cal.get(Calendar.DAY_OF_YEAR)}_${cal.get(Calendar.HOUR_OF_DAY)}_" +
+            "${cal.get(Calendar.MINUTE)}_${batteryPct}_$isCharging"
+        if (signature == lastSentStandbySignature) {
+            Log.d(TAG, "Skip duplicate standby dashboard: $signature")
+            return
+        }
+        lastSentStandbySignature = signature
+
         val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240)
         val jpegBytes = compressToSafeBaselineJpeg(dashboardBmp)
 
