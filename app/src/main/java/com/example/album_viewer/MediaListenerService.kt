@@ -67,7 +67,7 @@ class MediaListenerService : NotificationListenerService() {
     private val isUpdating = AtomicBoolean(false)
 
     private val activeControllers = ConcurrentHashMap<MediaController, MediaController.Callback>()
-    private val handledNotificationKeys = LruCache<String, Long>(50)
+    private val handledNotificationKeys = LruCache<String, Long>(300)
     private val artworkCache = LruCache<String, Bitmap>(30)
 
     private var currentTitle = ""
@@ -257,6 +257,11 @@ class MediaListenerService : NotificationListenerService() {
             val notifications = activeNotifications ?: return
             for (sbn in notifications) {
                 if (isShowingNotificationPopup) break
+                // スイープでは15分以上前の通知は対象外にする。
+                // 古い通知が重複防止キャッシュから追い出された後に「新規」と判定されて
+                // 再ポップアップするのを防ぎ、無駄な走査も抑える。
+                // onNotificationPosted 経由の通常ポップアップにはこの時間制限は付けない。
+                if (System.currentTimeMillis() - sbn.postTime > 15 * 60 * 1000L) continue
                 if (shouldShowNotificationPopup(sbn)) {
                     Log.d(TAG, "Sweep picked up missed notification: ${sbn.packageName}")
                     handleNotificationPopup(sbn)
