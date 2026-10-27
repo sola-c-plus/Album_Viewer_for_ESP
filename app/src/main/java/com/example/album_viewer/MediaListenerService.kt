@@ -1268,19 +1268,34 @@ class MediaListenerService : NotificationListenerService() {
         canvas.drawCircle(center, center, cardRadius, borderPaint)
 
         val headerY = 50f
-        var textStartX = 56f
-        if (appIcon != null) {
-            val iconScaled = Bitmap.createScaledBitmap(appIcon, 20, 20, true)
-            canvas.drawBitmap(iconScaled, 56f, headerY - 15f, null)
-            textStartX = 82f
-        }
-
         val appNamePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = accentColor
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
         }
-        canvas.drawText(appName, textStartX, headerY, appNamePaint)
+        // アプリ名行はセンタリングする。まずこの行の帯における円の弦幅を求め、
+        // はみ出す名前は末尾を省略してから、実測幅で中央に配置する。
+        // アイコンがある場合は「アイコン+名前」をひと組として中央に置く
+        // (片方だけ寄せると組全体がずれて見えるため)。
+        val headerMaxWidth = circleLineMaxWidth(center, cardRadius, headerY, appNamePaint.textSize)
+        val iconSize = 20f
+        val iconTextGap = 6f
+        val appNameMaxWidth = if (appIcon != null) {
+            headerMaxWidth - iconSize - iconTextGap
+        } else {
+            headerMaxWidth
+        }
+        val safeAppName = ellipsizeText(appName, appNamePaint, appNameMaxWidth)
+        val appNameWidth = appNamePaint.measureText(safeAppName)
+        if (appIcon != null) {
+            val groupWidth = iconSize + iconTextGap + appNameWidth
+            val groupStartX = center - groupWidth / 2f
+            val iconScaled = Bitmap.createScaledBitmap(appIcon, iconSize.toInt(), iconSize.toInt(), true)
+            canvas.drawBitmap(iconScaled, groupStartX, headerY - 15f, null)
+            canvas.drawText(safeAppName, groupStartX + iconSize + iconTextGap, headerY, appNamePaint)
+        } else {
+            canvas.drawText(safeAppName, center - appNameWidth / 2f, headerY, appNamePaint)
+        }
 
         val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
@@ -1289,16 +1304,21 @@ class MediaListenerService : NotificationListenerService() {
         }
         val titleMaxWidth = 176f
         val safeTitle = ellipsizeText(title, titlePaint, titleMaxWidth)
-        canvas.drawText(safeTitle, center - titleMaxWidth / 2f, 80f, titlePaint)
+        // 省略後の文字列の実測幅でセンタリングする (最大幅固定で置くと
+        // 短いタイトルが左寄りに見えるため)。
+        canvas.drawText(safeTitle, center - titlePaint.measureText(safeTitle) / 2f, 80f, titlePaint)
 
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(215, 220, 235)
             textSize = 12f
             typeface = Typeface.DEFAULT
         }
-        // 本文は最大4行まで折り返す。各行の最大幅は、その行の帯における
+        // 本文は最大5行まで折り返す。各行の最大幅は、その行の帯における
         // 円 (半径108) の弦幅から余白 16px を引いたものにする。
-        val bodyLineYs = floatArrayOf(104f, 124f, 144f, 164f)
+        // 5行目 (baseline 184) の帯の下端は約188で、カード下端 (228) にも
+        // ESP 側ドック表示の開始位置 (y=194) にも届かない。弦幅も約158px
+        // あり、本文 12px でも実用になる (実機で重なり無しを確認済み)。
+        val bodyLineYs = floatArrayOf(104f, 124f, 144f, 164f, 184f)
         val bodyLineWidths = bodyLineYs.map { y ->
             circleLineMaxWidth(center, cardRadius, y, textPaint.textSize)
         }
