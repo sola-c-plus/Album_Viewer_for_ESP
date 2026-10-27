@@ -299,7 +299,8 @@ class MediaListenerService : NotificationListenerService() {
                 MediaStateHolder.updateTrack(displayTitle, displayArtist, "", pkg, popupBitmap, jpegBytes)
             }
 
-            BluetoothSppManager.sendMediaPacket(displayTitle, displayArtist, "", jpegBytes, rgb565Color, rgb565Bg)
+            // ポップアップは送信中フレームを切らないよう、キャンセルしない順番待ち送信を使う
+            BluetoothSppManager.sendMediaPacketQueued(displayTitle, displayArtist, "", jpegBytes, rgb565Color, rgb565Bg)
 
             popupDismissJob = launch {
                 delay(5000)
@@ -1159,18 +1160,22 @@ class MediaListenerService : NotificationListenerService() {
         return bmp
     }
 
-    private fun compressToSafeBaselineJpeg(bitmap: Bitmap): ByteArray {
+    private fun compressToSafeBaselineJpeg(bitmap: Bitmap): ByteArray? {
         var quality = 65
         var stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
         var bytes = stream.toByteArray()
 
-        while (bytes.size > 20480 && quality > 25) {
-            quality -= 10
+        while (bytes.size > 20480 && quality > 10) {
+            quality = maxOf(10, quality - 10)
             stream = ByteArrayOutputStream()
             bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
             bytes = stream.toByteArray()
         }
+        // 品質10まで下げても上限を超える場合は画像を送らない。
+        // ESP側の受信上限 (24,576B) を超えると静かに読み捨てられるため、
+        // null を返してメタデータのみ送信する形にする。
+        if (bytes.size > 20480) return null
         return bytes
     }
 }
