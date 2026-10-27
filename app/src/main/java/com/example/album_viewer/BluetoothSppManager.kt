@@ -309,17 +309,17 @@ object BluetoothSppManager {
 
                 delay(100)
 
-                // 2. JPEGパケット送信 (チャンク1024B, flushはループ完了後に1回のみ)
+                // 2. JPEGパケット送信 (チャンク256B, flushはループ完了後に1回のみ)
                 if (jpegBytes != null && jpegBytes.isNotEmpty() && currentCoroutineContext().isActive) {
                     val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
                     val sendStartMs = System.currentTimeMillis()
                     var offset = 0
-                    val chunkSize = 1024
+                    val chunkSize = 256
                     while (offset < imgPacket.size && currentCoroutineContext().isActive) {
                         val len = minOf(chunkSize, imgPacket.size - offset)
                         out.write(imgPacket, offset, len)
                         offset += len
-                        if (offset < imgPacket.size) delay(2)
+                        if (offset < imgPacket.size) delay(10)
                     }
                     if (offset >= imgPacket.size) {
                         out.flush()
