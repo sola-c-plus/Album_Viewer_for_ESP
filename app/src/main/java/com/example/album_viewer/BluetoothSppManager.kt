@@ -18,6 +18,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Collections
 import java.util.UUID
 
 enum class ConnectionStatus {
@@ -43,6 +44,7 @@ object BluetoothSppManager {
     private var receiveJob: Job? = null
     private var reconnectJob: Job? = null
     private var activeSendJob: Job? = null
+    private val queuedSendJobs = Collections.synchronizedList(mutableListOf<Job>())
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
@@ -130,6 +132,11 @@ object BluetoothSppManager {
             reconnectJob?.cancel()
         }
         activeSendJob?.cancel()
+        // 順番待ち中のキュー送信も一緒にキャンセルする（切断後に古い内容が送られないように）
+        synchronized(queuedSendJobs) {
+            queuedSendJobs.forEach { it.cancel() }
+            queuedSendJobs.clear()
+        }
         closeSocketOnly()
         releaseWakeLock()
         _connectionStatus.value = ConnectionStatus.DISCONNECTED
@@ -274,9 +281,13 @@ object BluetoothSppManager {
         rgb565BgColor: Int = 0x0000
     ) {
         // キャンセル待ち行列化: activeSendJob には触れず、sendMutex が空くまで待つ
-        scope.launch {
-            sendPacketBody(title, artist, album, jpegBytes, rgb565Color, rgb565BgColor)
+        val enqueuedAtMs = System.currentTimeMillis()
+        val job = scope.launch {
+            sendPacketBody(title, artist, album, jpegBytes, rgb565Color, rgb565BgColor, enqueuedAtMs)
         }
+        // Job を保持し、切断時にキャンセルできるようにする。完了したら自動で外す
+        queuedSendJobs.add(job)
+        job.invokeOnCompletion { queuedSendJobs.remove(job) }
     }
 
     private suspend fun sendPacketBody(
@@ -285,7 +296,8 @@ object BluetoothSppManager {
         album: String,
         jpegBytes: ByteArray?,
         rgb565Color: Int,
-        rgb565BgColor: Int
+        rgb565BgColor: Int,
+        queuedAtMs: Long? = null
     ) {
         if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return
 
@@ -293,6 +305,16 @@ object BluetoothSppManager {
             try {
                 val out = outputStream ?: return@withLock
                 if (!currentCoroutineContext().isActive) return@withLock
+
+                // sendMutex 待ちの間に切断→再接続が起きていた場合は送らない。
+                // 再接続後の新しいソケットへ古い内容を書き込むのを防ぐ。
+                if (_connectionStatus.value != ConnectionStatus.CONNECTED) return@withLock
+
+                // 鮮度ガード: キュー送信が10秒以上滞留していたら、古いポップアップとして破棄する
+                if (queuedAtMs != null && System.currentTimeMillis() - queuedAtMs > 10_000L) {
+                    Log.d(TAG, "Dropped stale queued packet (over 10s old)")
+                    return@withLock
+                }
 
                 // 1. メタデータ送信
                 val metadataMap = mapOf(
