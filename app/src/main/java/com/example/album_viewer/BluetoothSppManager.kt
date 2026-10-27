@@ -301,26 +301,6 @@ object BluetoothSppManager {
         }
     }
 
-    fun sendTimeSyncPacket(hour: Int, minute: Int, second: Int) {
-        scope.launch {
-            if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
-            if (!sendMutex.tryLock()) return@launch
-
-            try {
-                val timeMap = mapOf("h" to hour, "m" to minute, "s" to second)
-                val jsonBytes = gson.toJson(timeMap).toByteArray(Charsets.UTF_8)
-                val timePacket = buildPacket(0x03.toByte(), jsonBytes)
-                val out = outputStream ?: return@launch
-                out.write(timePacket)
-                out.flush()
-            } catch (e: Exception) {
-                // ignore
-            } finally {
-                sendMutex.unlock()
-            }
-        }
-    }
-
     private fun buildPacket(type: Byte, payload: ByteArray): ByteArray {
         val buffer = ByteBuffer.allocate(2 + 1 + 4 + payload.size)
         buffer.order(ByteOrder.BIG_ENDIAN)
