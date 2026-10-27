@@ -254,48 +254,80 @@ object BluetoothSppManager {
         activeSendJob?.cancel()
 
         activeSendJob = scope.launch {
-            if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return@launch
+            sendPacketBody(title, artist, album, jpegBytes, rgb565Color, rgb565BgColor)
+        }
+    }
 
-            sendMutex.withLock {
-                try {
-                    val out = outputStream ?: return@withLock
-                    if (!isActive) return@withLock
+    /**
+     * ★ 通知ポップアップ用: 送信中ジョブをキャンセルせず、送信が空くまで待ってから送る
+     *
+     * 曲/スタンバイ送信を途中で切るとフレームが途中で切れて ESP 側が後続パケットを
+     * 解釈できず、ポップアップ画像が描画されなくなるため、ポップアップはこちらを使う。
+     * 通常送信の「最新優先でキャンセル」挙動は変えない。
+     */
+    fun sendMediaPacketQueued(
+        title: String,
+        artist: String,
+        album: String,
+        jpegBytes: ByteArray?,
+        rgb565Color: Int = 0x067F,
+        rgb565BgColor: Int = 0x0000
+    ) {
+        // キャンセル待ち行列化: activeSendJob には触れず、sendMutex が空くまで待つ
+        scope.launch {
+            sendPacketBody(title, artist, album, jpegBytes, rgb565Color, rgb565BgColor)
+        }
+    }
 
-                    // 1. メタデータ送信
-                    val metadataMap = mapOf(
-                        "title" to title,
-                        "artist" to artist,
-                        "album" to album,
-                        "color" to rgb565Color,
-                        "bg" to rgb565BgColor
-                    )
-                    val jsonBytes = gson.toJson(metadataMap).toByteArray(Charsets.UTF_8)
-                    val metaPacket = buildPacket(0x01.toByte(), jsonBytes)
-                    out.write(metaPacket)
-                    out.flush()
+    private suspend fun sendPacketBody(
+        title: String,
+        artist: String,
+        album: String,
+        jpegBytes: ByteArray?,
+        rgb565Color: Int,
+        rgb565BgColor: Int
+    ) {
+        if (_connectionStatus.value != ConnectionStatus.CONNECTED || outputStream == null) return
 
-                    delay(100)
+        sendMutex.withLock {
+            try {
+                val out = outputStream ?: return@withLock
+                if (!currentCoroutineContext().isActive) return@withLock
 
-                    // 2. JPEGパケット送信 (チャンク256B, ディレイ5msで0.3秒以内に完了)
-                    if (jpegBytes != null && jpegBytes.isNotEmpty() && isActive) {
-                        val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
-                        var offset = 0
-                        val chunkSize = 256
-                        while (offset < imgPacket.size && isActive) {
-                            val len = minOf(chunkSize, imgPacket.size - offset)
-                            out.write(imgPacket, offset, len)
-                            out.flush()
-                            offset += len
-                            delay(5)
-                        }
+                // 1. メタデータ送信
+                val metadataMap = mapOf(
+                    "title" to title,
+                    "artist" to artist,
+                    "album" to album,
+                    "color" to rgb565Color,
+                    "bg" to rgb565BgColor
+                )
+                val jsonBytes = gson.toJson(metadataMap).toByteArray(Charsets.UTF_8)
+                val metaPacket = buildPacket(0x01.toByte(), jsonBytes)
+                out.write(metaPacket)
+                out.flush()
+
+                delay(100)
+
+                // 2. JPEGパケット送信 (チャンク256B, ディレイ5msで0.3秒以内に完了)
+                if (jpegBytes != null && jpegBytes.isNotEmpty() && currentCoroutineContext().isActive) {
+                    val imgPacket = buildPacket(0x02.toByte(), jpegBytes)
+                    var offset = 0
+                    val chunkSize = 256
+                    while (offset < imgPacket.size && currentCoroutineContext().isActive) {
+                        val len = minOf(chunkSize, imgPacket.size - offset)
+                        out.write(imgPacket, offset, len)
+                        out.flush()
+                        offset += len
+                        delay(5)
                     }
-                } catch (e: Exception) {
-                    if (e !is CancellationException) {
-                        Log.e(TAG, "Failed to send media packet: ${e.message}")
-                        _connectionStatus.value = ConnectionStatus.ERROR
-                        closeSocketOnly()
-                        triggerAutoReconnect()
-                    }
+                }
+            } catch (e: Exception) {
+                if (e !is CancellationException) {
+                    Log.e(TAG, "Failed to send media packet: ${e.message}")
+                    _connectionStatus.value = ConnectionStatus.ERROR
+                    closeSocketOnly()
+                    triggerAutoReconnect()
                 }
             }
         }
