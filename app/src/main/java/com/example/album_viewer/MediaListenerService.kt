@@ -1129,6 +1129,7 @@ class MediaListenerService : NotificationListenerService() {
         // 円形ディスプレイ (GC9A01) に合わせ、カード自体もディスプレイと同心の
         // 円形 (中心 120,120・半径 108) にする。テキストは各行の y における円の
         // 弦幅に収まる範囲へ配置する。
+        // 中身は下部に ESP のドック表示が重なるため、全体を 14px 上寄せにしている。
         val center = targetSize / 2f
         val cardRadius = 108f
         val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1143,12 +1144,12 @@ class MediaListenerService : NotificationListenerService() {
         canvas.drawCircle(center, center, cardRadius, cardPaint)
         canvas.drawCircle(center, center, cardRadius, borderPaint)
 
-        val headerY = 64f
-        var textStartX = 46f
+        val headerY = 50f
+        var textStartX = 56f
         if (appIcon != null) {
             val iconScaled = Bitmap.createScaledBitmap(appIcon, 20, 20, true)
-            canvas.drawBitmap(iconScaled, 46f, headerY - 15f, null)
-            textStartX = 72f
+            canvas.drawBitmap(iconScaled, 56f, headerY - 15f, null)
+            textStartX = 82f
         }
 
         val appNamePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1165,7 +1166,7 @@ class MediaListenerService : NotificationListenerService() {
         }
         val titleMaxWidth = 176f
         val safeTitle = ellipsizeText(title, titlePaint, titleMaxWidth)
-        canvas.drawText(safeTitle, center - titleMaxWidth / 2f, 94f, titlePaint)
+        canvas.drawText(safeTitle, center - titleMaxWidth / 2f, 80f, titlePaint)
 
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(215, 220, 235)
@@ -1174,7 +1175,7 @@ class MediaListenerService : NotificationListenerService() {
         }
         // 本文は最大4行まで折り返す。各行の最大幅は、その行の帯における
         // 円 (半径108) の弦幅から余白 16px を引いたものにする。
-        val bodyLineYs = floatArrayOf(118f, 138f, 158f, 178f)
+        val bodyLineYs = floatArrayOf(104f, 124f, 144f, 164f)
         val bodyLineWidths = bodyLineYs.map { y ->
             circleLineMaxWidth(center, cardRadius, y, textPaint.textSize)
         }
