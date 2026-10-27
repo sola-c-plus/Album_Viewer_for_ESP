@@ -42,6 +42,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
+import kotlin.coroutines.resume
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -80,6 +81,11 @@ class MediaListenerService : NotificationListenerService() {
     private var currentArtist = ""
     private var currentPackage = ""
     private var lastSentTrackSignature = ""
+    // プロトコル v2 では署名は「転送成功時」にコミットする (設計書 §5.3)。
+    // 送信中の内容の署名をここに保持し、重複送信を防ぎつつ、失敗したら
+    // コミットされないまま残ることで次の監視ティックで自然に再送させる。
+    private var pendingTrackSignature = ""
+    private var pendingStandbySignature = ""
     private var isShowingNotificationPopup = false
     private var isFirstListenerConnection = true
     private val isSweepingNotifications = AtomicBoolean(false)
@@ -168,8 +174,10 @@ class MediaListenerService : NotificationListenerService() {
                     currentArtist = ""
                     currentPackage = ""
                     lastSentTrackSignature = ""
+                    pendingTrackSignature = ""
                     lastSentMinute = -1
                     lastSentStandbySignature = ""
+                    pendingStandbySignature = ""
                     stopDetectionTimestamp = 0L
                     triggerUpdateDirect()
                 }
@@ -353,6 +361,8 @@ class MediaListenerService : NotificationListenerService() {
         // コルーチン内で非同期に立てると、スイープ等の連続呼び出しが
         // フラグのチェックをすり抜け、複数ポップアップが同時発火する。
         isShowingNotificationPopup = true
+        // ポップアップの表示窓 (10秒) の起点。転送リトライの可否判定に使う。
+        val popupStartMs = System.currentTimeMillis()
 
         serviceScope.launch {
             try {
@@ -383,9 +393,7 @@ class MediaListenerService : NotificationListenerService() {
                     MediaStateHolder.updateTrack(displayTitle, displayArtist, "", pkg, popupBitmap, jpegBytes)
                 }
 
-                // ポップアップは送信中フレームを切らないよう、キャンセルしない順番待ち送信を使う
-                BluetoothSppManager.sendMediaPacketQueued(displayTitle, displayArtist, "", jpegBytes, rgb565Color, rgb565Bg)
-
+                // 表示窓 (10秒) は転送の成否に依らず進めるため、先に解除ジョブを起動する
                 popupDismissJob = launch {
                     delay(10000)
                     isShowingNotificationPopup = false
@@ -393,7 +401,30 @@ class MediaListenerService : NotificationListenerService() {
                     stopDetectionTimestamp = 0L
                     lastSentTrackSignature = ""
                     lastSentStandbySignature = ""
+                    pendingTrackSignature = ""
+                    pendingStandbySignature = ""
                     triggerUpdateDirect()
+                }
+
+                // ポップアップは送信中フレームを切らないよう、キャンセルしない順番待ち送信を使う。
+                // プロトコル v2 では転送結果が返るため、失敗した場合は表示窓の範囲内で
+                // 最大2回まで全体リトライする (設計書 §5.3 / §8 D9)。ポップアップは
+                // イベント性コンテンツで「次の更新で自然に再送」が効かないため。
+                var attempt = 0
+                var delivered = false
+                while (!delivered && attempt < 3) {
+                    if (attempt > 0) {
+                        // リトライ前の鮮度確認: まだ表示中か、表示窓内か、接続が生きているか
+                        if (!isShowingNotificationPopup) break
+                        if (System.currentTimeMillis() - popupStartMs >= 10_000L) break
+                        if (BluetoothSppManager.connectionStatus.value != ConnectionStatus.CONNECTED) break
+                        Log.d(TAG, "Retrying popup transfer: attempt=${attempt + 1}")
+                    }
+                    delivered = sendPopupOnce(displayTitle, displayArtist, jpegBytes, rgb565Color, rgb565Bg)
+                    attempt++
+                }
+                if (!delivered) {
+                    Log.w(TAG, "Popup transfer failed after $attempt attempt(s)")
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -407,8 +438,24 @@ class MediaListenerService : NotificationListenerService() {
                 stopDetectionTimestamp = 0L
                 lastSentTrackSignature = ""
                 lastSentStandbySignature = ""
+                pendingTrackSignature = ""
+                pendingStandbySignature = ""
                 triggerUpdateDirect()
             }
+        }
+    }
+
+    // ポップアップ送信1回分を、転送結果が返るまで待って真偽で返す。
+    // BluetoothSppManager の結果コールバックを suspend で受けるための薄いラッパー。
+    private suspend fun sendPopupOnce(
+        title: String,
+        artist: String,
+        jpegBytes: ByteArray?,
+        rgb565Color: Int,
+        rgb565Bg: Int
+    ): Boolean = suspendCancellableCoroutine { cont ->
+        BluetoothSppManager.sendMediaPacketQueued(title, artist, "", jpegBytes, rgb565Color, rgb565Bg) { success ->
+            if (cont.isActive) cont.resume(success)
         }
     }
 
@@ -484,15 +531,19 @@ class MediaListenerService : NotificationListenerService() {
                 stopDetectionTimestamp = 0L
                 isStandbyScreenActive = false
                 lastSentStandbySignature = ""
+                pendingStandbySignature = ""
 
                 val hasArt = (trackInfo.bitmap != null)
                 val artSignature = trackInfo.bitmap?.let { "${it.width}x${it.height}_${it.generationId}_${it.allocationByteCount}" } ?: "no_art"
                 val trackSignature = "${trackInfo.packageName}_${trackInfo.title}_${trackInfo.artist}_${hasArt}_$artSignature"
 
-                val isNewTrackOrArtUpdated = (trackSignature != lastSentTrackSignature)
+                // 送信中 (pending) の内容も重複送信しない。コミット済みでも送信中でも
+                // ない内容だけが新規として送られる。
+                val isNewTrackOrArtUpdated = (trackSignature != lastSentTrackSignature &&
+                    trackSignature != pendingTrackSignature)
 
                 if (isNewTrackOrArtUpdated) {
-                    lastSentTrackSignature = trackSignature
+                    pendingTrackSignature = trackSignature
                     currentTitle = trackInfo.title
                     currentArtist = trackInfo.artist
                     currentPackage = trackInfo.packageName
@@ -510,7 +561,18 @@ class MediaListenerService : NotificationListenerService() {
                     }
 
                     lastDisplayedBitmap = squareBmp
-                    BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes, rgb565Accent, rgb565Bg)
+                    // 署名は転送成功時にコミットする (設計書 §5.3)。失敗した場合は
+                    // コミットされないため、次の監視ティックで同じ内容が再送される。
+                    BluetoothSppManager.sendMediaPacket(trackInfo.title, trackInfo.artist, trackInfo.album, jpegBytes, rgb565Accent, rgb565Bg) { success ->
+                        val stillPending = (pendingTrackSignature == trackSignature)
+                        if (stillPending) pendingTrackSignature = ""
+                        if (success && stillPending) {
+                            lastSentTrackSignature = trackSignature
+                            Log.d(TAG, "Track transfer confirmed: ${trackInfo.title}")
+                        } else if (!success) {
+                            Log.w(TAG, "Track transfer failed, will retry on next update: ${trackInfo.title}")
+                        }
+                    }
                     Log.d(TAG, "Sent Track Art: ${trackInfo.title} (hasArt=$hasArt)")
 
                     if (!hasArt) {
@@ -528,17 +590,17 @@ class MediaListenerService : NotificationListenerService() {
                 } else if (!isStandbyScreenActive && (now - stopDetectionTimestamp >= 2500L)) {
                     isStandbyScreenActive = true
                     lastSentTrackSignature = ""
+                    pendingTrackSignature = ""
                     currentTitle = ""
                     currentArtist = ""
                     currentPackage = ""
-                    lastSentMinute = currentMinute
-                    lastSentBatteryPct = batteryPct
+                    // lastSentMinute / lastSentBatteryPct は sendStandbyDashboard 側で
+                    // 転送成功時にコミットする (ここで先に進めると、転送失敗時に
+                    // 分・電池の変化条件が消えて自己回復できなくなる)。
 
                     sendStandbyDashboard(cal, batteryPct, isCharging)
                 } else if (isStandbyScreenActive) {
                     if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5) {
-                        lastSentMinute = currentMinute
-                        lastSentBatteryPct = batteryPct
                         sendStandbyDashboard(cal, batteryPct, isCharging)
                     }
                 }
@@ -577,13 +639,18 @@ class MediaListenerService : NotificationListenerService() {
         // 競合する2回目は引き続き抑止できる。逆にクリアしないと、復帰送信自体が
         // 同一内容として抑止され、ポップアップ画像や曲アートが次の分境界まで
         // ESP に残ってしまう。
+        // プロトコル v2 では、コミット済み署名 (lastSentStandbySignature) に加えて
+        // 送信中署名 (pendingStandbySignature) でも抑止し、コミットは転送成功時に
+        // 行う。クリア対象には pending 側も含める（でないと送信中だった内容の
+        // コールバックが後からコミットしてしまい、復帰送信が抑止される）。
         val signature = "${cal.get(Calendar.DAY_OF_YEAR)}_${cal.get(Calendar.HOUR_OF_DAY)}_" +
             "${cal.get(Calendar.MINUTE)}_${batteryPct}_$isCharging"
-        if (signature == lastSentStandbySignature) {
+        if (signature == lastSentStandbySignature || signature == pendingStandbySignature) {
             Log.d(TAG, "Skip duplicate standby dashboard: $signature")
             return
         }
-        lastSentStandbySignature = signature
+        pendingStandbySignature = signature
+        val sentMinute = cal.get(Calendar.MINUTE)
 
         val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240)
         val jpegBytes = compressToSafeBaselineJpeg(dashboardBmp)
@@ -598,7 +665,19 @@ class MediaListenerService : NotificationListenerService() {
         }
 
         lastDisplayedBitmap = dashboardBmp
-        BluetoothSppManager.sendMediaPacket(title, artist, "", jpegBytes, defaultCyanRgb565, blackBgRgb565)
+        // 署名と分・電池の記録は転送成功時にコミットする (設計書 §5.3)。
+        // 失敗したら何も記録されないため、次の監視ティックで再送条件が再び立つ。
+        BluetoothSppManager.sendMediaPacket(title, artist, "", jpegBytes, defaultCyanRgb565, blackBgRgb565) { success ->
+            val stillPending = (pendingStandbySignature == signature)
+            if (stillPending) pendingStandbySignature = ""
+            if (success && stillPending) {
+                lastSentStandbySignature = signature
+                lastSentMinute = sentMinute
+                lastSentBatteryPct = batteryPct
+            } else if (!success) {
+                Log.w(TAG, "Standby transfer failed, will retry on next update: $signature")
+            }
+        }
     }
 
     private data class PaletteResult(val accentRgb565: Int, val bgRgb565: Int, val fullBgColor: Int)
