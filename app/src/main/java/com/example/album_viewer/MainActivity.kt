@@ -74,6 +74,7 @@ fun MainScreen() {
     val context = LocalContext.current
     val connectionStatus by BluetoothSppManager.connectionStatus.collectAsState()
     val connectedDeviceName by BluetoothSppManager.connectedDeviceName.collectAsState()
+    val handshakeStatus by BluetoothSppManager.handshakeStatus.collectAsState()
     val currentTrack by MediaStateHolder.currentTrack.collectAsState()
 
     var hasBtPermission by remember {
@@ -237,7 +238,11 @@ fun MainScreen() {
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     val (statusText, statusColor) = when (connectionStatus) {
-                        ConnectionStatus.CONNECTED -> "接続完了 (${connectedDeviceName})" to Color(0xFF4CAF50)
+                        ConnectionStatus.CONNECTED -> when (handshakeStatus) {
+                            HandshakeStatus.READY -> "接続完了 (${connectedDeviceName})" to Color(0xFF4CAF50)
+                            HandshakeStatus.VERSION_MISMATCH -> "接続完了 (${connectedDeviceName})" to Color(0xFF4CAF50)
+                            else -> "接続完了 (${connectedDeviceName}) / ハンドシェイク中..." to Color(0xFFFFC107)
+                        }
                         ConnectionStatus.CONNECTING -> "接続中 / 自動再接続中..." to Color(0xFFFFC107)
                         ConnectionStatus.ERROR -> "接続待機中 (自動リトライ)" to Color(0xFFF44336)
                         ConnectionStatus.DISCONNECTED -> "未接続" to Color.Gray
@@ -245,6 +250,20 @@ fun MainScreen() {
                     Box(modifier = Modifier.size(10.dp).background(statusColor, CircleShape))
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(text = statusText, color = statusColor, fontSize = 14.sp)
+                }
+
+                // プロトコル版不一致: RFCOMM はつながっているが転送できない状態。
+                // ESP ファームの更新が必要であることを判別できるよう明示する。
+                if (connectionStatus == ConnectionStatus.CONNECTED &&
+                    handshakeStatus == HandshakeStatus.VERSION_MISMATCH
+                ) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "⚠ ESP32のファームウェア更新が必要です（プロトコル不一致のため、表示は更新されません）",
+                        color = Color(0xFFFF6B6B),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))
