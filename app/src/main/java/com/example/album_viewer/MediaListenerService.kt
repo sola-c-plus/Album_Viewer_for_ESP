@@ -259,6 +259,9 @@ class MediaListenerService : NotificationListenerService() {
                 if (shouldShowNotificationPopup(sbn)) {
                     Log.d(TAG, "Sweep picked up missed notification: ${sbn.packageName}")
                     handleNotificationPopup(sbn)
+                    // 1回の走査で起動するポップアップは1件まで。
+                    // 残りは次回ティックのスイープで順に拾う。
+                    break
                 }
             }
         } catch (e: Exception) {
@@ -327,38 +330,56 @@ class MediaListenerService : NotificationListenerService() {
         val appIcon = getAppIconBitmap(pkg, notif)
         val accentColor = getAppAccentColor(pkg)
 
+        // 表示中フラグはコルーチン起動「前」に同期的に立てる。
+        // コルーチン内で非同期に立てると、スイープ等の連続呼び出しが
+        // フラグのチェックをすり抜け、複数ポップアップが同時発火する。
+        isShowingNotificationPopup = true
+
         serviceScope.launch {
-            isShowingNotificationPopup = true
-            popupDismissJob?.cancel()
+            try {
+                popupDismissJob?.cancel()
 
-            val popupBitmap = drawNotificationPopupOnBitmap(
-                baseBitmap = lastRawArtwork,
-                appName = appName,
-                title = title.ifBlank { appName },
-                text = text.ifBlank { "新しい通知があります" },
-                appIcon = appIcon,
-                accentColor = accentColor,
-                targetSize = 240
-            )
+                val popupBitmap = drawNotificationPopupOnBitmap(
+                    baseBitmap = lastRawArtwork,
+                    appName = appName,
+                    title = title.ifBlank { appName },
+                    text = text.ifBlank { "新しい通知があります" },
+                    appIcon = appIcon,
+                    accentColor = accentColor,
+                    targetSize = 240
+                )
 
-            // ポップアップ画像は写真背景で大きくなりやすく、大きな転送が ESP に
-            // 届き切らない実績があるため、届く実績のあるサイズ (8KB) を目標にする。
-            val jpegBytes = compressToSafeBaselineJpeg(popupBitmap, targetBytes = 8192)
-            Log.d(TAG, "Popup image: ${jpegBytes?.size ?: -1} bytes")
-            val displayTitle = "🔔 $appName: $title"
-            val displayArtist = text
-            val rgb565Color = colorToRgb565(accentColor)
-            val rgb565Bg = 0x0000
+                // ポップアップ画像は写真背景で大きくなりやすく、大きな転送が ESP に
+                // 届き切らない実績があるため、届く実績のあるサイズ (8KB) を目標にする。
+                val jpegBytes = compressToSafeBaselineJpeg(popupBitmap, targetBytes = 8192)
+                Log.d(TAG, "Popup image: ${jpegBytes?.size ?: -1} bytes")
+                val displayTitle = "🔔 $appName: $title"
+                val displayArtist = text
+                val rgb565Color = colorToRgb565(accentColor)
+                val rgb565Bg = 0x0000
 
-            withContext(Dispatchers.Main) {
-                MediaStateHolder.updateTrack(displayTitle, displayArtist, "", pkg, popupBitmap, jpegBytes)
-            }
+                withContext(Dispatchers.Main) {
+                    MediaStateHolder.updateTrack(displayTitle, displayArtist, "", pkg, popupBitmap, jpegBytes)
+                }
 
-            // ポップアップは送信中フレームを切らないよう、キャンセルしない順番待ち送信を使う
-            BluetoothSppManager.sendMediaPacketQueued(displayTitle, displayArtist, "", jpegBytes, rgb565Color, rgb565Bg)
+                // ポップアップは送信中フレームを切らないよう、キャンセルしない順番待ち送信を使う
+                BluetoothSppManager.sendMediaPacketQueued(displayTitle, displayArtist, "", jpegBytes, rgb565Color, rgb565Bg)
 
-            popupDismissJob = launch {
-                delay(5000)
+                popupDismissJob = launch {
+                    delay(5000)
+                    isShowingNotificationPopup = false
+                    isStandbyScreenActive = false
+                    stopDetectionTimestamp = 0L
+                    lastSentTrackSignature = ""
+                    triggerUpdateDirect()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 描画・圧縮・送信のどこかで例外が出ても、表示中フラグが張り付いて
+                // 以後の表示更新（曲・スタンバイ・ポップアップ）がサービス再起動まで
+                // 全停止しないよう、状態をリセットして通常更新へ復帰させる。
+                Log.e(TAG, "Error in notification popup handling", e)
                 isShowingNotificationPopup = false
                 isStandbyScreenActive = false
                 stopDetectionTimestamp = 0L
