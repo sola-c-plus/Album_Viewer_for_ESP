@@ -18,6 +18,7 @@ import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Icon
@@ -103,6 +104,9 @@ class MediaListenerService : NotificationListenerService() {
     private var lastSentMinute = -1
     private var lastSentBatteryPct = -1
     private var lastSentStandbySignature = ""
+    // 最後に送信が成功したスタンバイ画面に含まれていた通知ダイジェスト。
+    // 分・電池%が変わらなくても、通知の増減だけで再送条件を立てるために使う。
+    private var lastSentNotificationDigest = ""
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         registerControllerCallbacks(controllers)
@@ -719,7 +723,13 @@ class MediaListenerService : NotificationListenerService() {
 
                     sendStandbyDashboard(cal, batteryPct, isCharging)
                 } else if (isStandbyScreenActive) {
-                    if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5) {
+                    // 分・電池%の変化に加え、溜まっている通知の増減でも再送する。
+                    // 署名にもダイジェストが入っているため、内容が同じなら
+                    // sendStandbyDashboard 側で重複送信として抑止される。
+                    val notifDigest = buildStandbyNotificationState().second
+                    if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5 ||
+                        notifDigest != lastSentNotificationDigest
+                    ) {
                         sendStandbyDashboard(cal, batteryPct, isCharging)
                     }
                 }
@@ -749,8 +759,81 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
+    // スタンバイ画面下部に表示する「溜まっている通知」1件分の表示データ。
+    private data class StandbyNotificationItem(
+        val appName: String,
+        val title: String,
+        val accentColor: Int,
+        val keyHash: Int,
+        val postTime: Long
+    )
+
+    /**
+     * シェードに溜まっている通知を、スタンバイ画面のリスト表示用に収集する。
+     * 対象判定は副作用のない専用フィルタ (isStandbyListTarget) で行う。
+     * shouldShowNotificationPopup は handledNotificationKeys への登録という
+     * 副作用があるため、リスト生成に流用するとポップアップの重複防止が壊れる。
+     * 戻り値は (表示用リスト [新しい順], 通知ダイジェスト)。
+     * ダイジェストはスタンバイ署名と再送条件に使い、通知の増減を検知する。
+     */
+    private fun buildStandbyNotificationState(): Pair<List<StandbyNotificationItem>, String> {
+        return try {
+            val notifications = activeNotifications ?: return Pair(emptyList(), "n0")
+            val items = notifications
+                .filter { isStandbyListTarget(it) }
+                .sortedByDescending { it.postTime }
+                .map { sbn ->
+                    val extras = sbn.notification.extras
+                    StandbyNotificationItem(
+                        appName = getAppDisplayName(sbn.packageName),
+                        title = extractTitle(null, extras).ifBlank { extractArtist(null, extras) },
+                        accentColor = getAppAccentColor(sbn.packageName),
+                        keyHash = sbn.key.hashCode(),
+                        postTime = sbn.postTime
+                    )
+                }
+            val digest = if (items.isEmpty()) {
+                "n0"
+            } else {
+                "n${items.size}_${items.first().keyHash}_${items.first().postTime}"
+            }
+            Pair(items, digest)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error building standby notification state", e)
+            Pair(emptyList(), "n0")
+        }
+    }
+
+    // スタンバイのリスト表示専用の対象判定 (副作用なし)。
+    // 対象アプリの集合と基本的な除外条件はポップアップ側と揃えるが、
+    // handledNotificationKeys には一切触れない。
+    private fun isStandbyListTarget(sbn: StatusBarNotification): Boolean {
+        if (sbn.packageName == packageName) return false
+        if (sbn.isOngoing) return false
+
+        val notif = sbn.notification ?: return false
+        if (notif.flags and Notification.FLAG_GROUP_SUMMARY != 0) return false
+        val extras = notif.extras ?: return false
+        if (extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) return false
+
+        val pkg = sbn.packageName.lowercase()
+        val isTargetApp = pkg.contains("line") || pkg.contains("discord") ||
+                          pkg.contains("dialer") || pkg.contains("telecom") ||
+                          pkg.contains("messaging") || pkg.contains("mms") ||
+                          pkg.contains("twitter") || pkg.contains("instagram") ||
+                          pkg.contains("slack") || pkg.contains("whatsapp") ||
+                          pkg.contains("gmail") || pkg.contains("mail") ||
+                          pkg.contains("facebook.aura")
+
+        if (!isTargetApp) return false
+
+        val title = extractTitle(null, extras)
+        val text = extractArtist(null, extras)
+        return title.isNotBlank() || text.isNotBlank()
+    }
+
     private suspend fun sendStandbyDashboard(cal: Calendar, batteryPct: Int, isCharging: Boolean) {
-        // 同一内容（分・電池%・充電状態）の二重送信を防ぐ署名ガード（唯一の送信チョークポイント）。
+        // 同一内容（分・電池%・充電状態・通知ダイジェスト）の二重送信を防ぐ署名ガード（唯一の送信チョークポイント）。
         // 接続リセットやポップアップ解除による再遷移と、分切り替わりの再送分岐が重なっても、
         // 内容が同じなら実際に送るのは1回だけにする。
         // 署名は「復帰送信が前提のリセット経路」（ポップアップ解除・再接続・再生開始）で
@@ -762,8 +845,9 @@ class MediaListenerService : NotificationListenerService() {
         // 送信中署名 (pendingStandbySignature) でも抑止し、コミットは転送成功時に
         // 行う。クリア対象には pending 側も含める（でないと送信中だった内容の
         // コールバックが後からコミットしてしまい、復帰送信が抑止される）。
+        val (standbyNotifs, notifDigest) = buildStandbyNotificationState()
         val signature = "${cal.get(Calendar.DAY_OF_YEAR)}_${cal.get(Calendar.HOUR_OF_DAY)}_" +
-            "${cal.get(Calendar.MINUTE)}_${batteryPct}_$isCharging"
+            "${cal.get(Calendar.MINUTE)}_${batteryPct}_$isCharging" + "_$notifDigest"
         if (signature == lastSentStandbySignature || signature == pendingStandbySignature) {
             Log.d(TAG, "Skip duplicate standby dashboard: $signature")
             return
@@ -771,7 +855,7 @@ class MediaListenerService : NotificationListenerService() {
         pendingStandbySignature = signature
         val sentMinute = cal.get(Calendar.MINUTE)
 
-        val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240)
+        val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240, standbyNotifs)
         val jpegBytes = compressToSafeBaselineJpeg(dashboardBmp)
 
         val title = "📱 SMART STANDBY"
@@ -793,6 +877,7 @@ class MediaListenerService : NotificationListenerService() {
                 lastSentStandbySignature = signature
                 lastSentMinute = sentMinute
                 lastSentBatteryPct = batteryPct
+                lastSentNotificationDigest = notifDigest
             } else if (!success) {
                 Log.w(TAG, "Standby transfer failed, will retry on next update: $signature")
             }
@@ -1282,7 +1367,8 @@ class MediaListenerService : NotificationListenerService() {
         cal: Calendar,
         batteryPct: Int,
         isCharging: Boolean,
-        size: Int = 240
+        size: Int = 240,
+        notifications: List<StandbyNotificationItem> = emptyList()
     ): Bitmap {
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
         val canvas = Canvas(bmp)
@@ -1314,21 +1400,144 @@ class MediaListenerService : NotificationListenerService() {
         }
         canvas.drawText(timeStr, 120f, 102f, timePaint)
 
-        val battStr = if (isCharging) "⚡ $batteryPct%" else "🔋 $batteryPct%"
+        // バッテリー行 (baseline 136、配置は現行維持)。絵文字文字列ではなく、
+        // Canvas 図形で描いた電池アイコン＋%表示に置き換える。
+        // アイコンと%をひと組として実測幅でセンタリングする。
         val battColor = when {
             isCharging -> Color.rgb(52, 199, 89)
             batteryPct <= 20 -> Color.rgb(255, 69, 58)
             else -> Color.rgb(0, 210, 255)
         }
-        val battPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        val battBaseline = 136f
+        val pctStr = "$batteryPct%"
+        val pctPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = battColor
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
-            textAlign = Paint.Align.CENTER
+            textAlign = Paint.Align.LEFT
         }
-        canvas.drawText(battStr, 120f, 136f, battPaint)
+        val pctWidth = pctPaint.measureText(pctStr)
+
+        val iconBodyW = 30f
+        val iconBodyH = 16f
+        val terminalGap = 2f
+        val terminalW = 3.5f
+        val iconTextGap = 7f
+        val battGroupWidth = iconBodyW + terminalGap + terminalW + iconTextGap + pctWidth
+        val iconLeft = 120f - battGroupWidth / 2f
+        // アイコンの縦中心を % の字面の中心 (baseline の約5px上) に合わせる
+        val iconTop = battBaseline - 5f - iconBodyH / 2f
+        val iconBottom = iconTop + iconBodyH
+
+        val battStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = battColor
+            style = Paint.Style.STROKE
+            strokeWidth = 1.8f
+        }
+        val battFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = battColor
+            style = Paint.Style.FILL
+        }
+        // 電池の枠 (角丸矩形)
+        canvas.drawRoundRect(RectF(iconLeft, iconTop, iconLeft + iconBodyW, iconBottom), 4f, 4f, battStrokePaint)
+        // 端子突起
+        val terminalLeft = iconLeft + iconBodyW + terminalGap
+        canvas.drawRoundRect(
+            RectF(terminalLeft, iconTop + 4f, terminalLeft + terminalW, iconBottom - 4f),
+            1.5f, 1.5f, battFillPaint
+        )
+        // 残量フィル (枠の内側を残量比で塗る)
+        val fillInset = 3f
+        val fillMaxWidth = iconBodyW - fillInset * 2f
+        val fillWidth = fillMaxWidth * batteryPct.coerceIn(0, 100) / 100f
+        if (fillWidth > 0f) {
+            canvas.drawRoundRect(
+                RectF(iconLeft + fillInset, iconTop + fillInset, iconLeft + fillInset + fillWidth, iconBottom - fillInset),
+                2f, 2f, battFillPaint
+            )
+        }
+        // 充電時は電池アイコンの中央に白い稲妻を描く
+        // (フィルが少ない残量でも暗背景・フィル色の両方に対して視認できるよう白にする)
+        if (isCharging) {
+            val boltPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.FILL
+            }
+            val bolt = Path().apply {
+                moveTo(iconLeft + 17.5f, iconTop + 1.5f)
+                lineTo(iconLeft + 11.0f, iconTop + 9.5f)
+                lineTo(iconLeft + 14.8f, iconTop + 9.5f)
+                lineTo(iconLeft + 12.5f, iconTop + 14.5f)
+                lineTo(iconLeft + 19.5f, iconTop + 6.0f)
+                lineTo(iconLeft + 15.7f, iconTop + 6.0f)
+                close()
+            }
+            canvas.drawPath(bolt, boltPaint)
+        }
+        canvas.drawText(pctStr, terminalLeft + terminalW + iconTextGap, battBaseline, pctPaint)
+
+        // 溜まっている通知のリスト (最大3件)。0件のときは何も描かず、
+        // 時計ブロックだけの従来表示と完全に同じ見た目になる。
+        if (notifications.isNotEmpty()) {
+            drawStandbyNotificationList(canvas, notifications)
+        }
 
         return bmp
+    }
+
+    // スタンバイ画面下部 (y≈156–212) に通知リストを描く。
+    // 各行はアプリ色ドット＋アプリ名 (太字・アプリ色) ＋タイトル (薄色) で、
+    // 行ごとの円の弦幅に収まるようタイトルを省略する。
+    // 4件以上ある場合は3件表示し、最下部に「全 N 件」のフッタを置く。
+    private fun drawStandbyNotificationList(canvas: Canvas, notifications: List<StandbyNotificationItem>) {
+        val center = 120f
+        val ringRadius = 112f
+        val rowBaselines = floatArrayOf(170f, 188f, 206f)
+
+        val namePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.LEFT
+        }
+        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(215, 220, 235)
+            textSize = 11f
+            textAlign = Paint.Align.LEFT
+        }
+        val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+
+        notifications.take(3).forEachIndexed { index, item ->
+            val baseline = rowBaselines[index]
+            val maxWidth = circleLineMaxWidth(center, ringRadius, baseline, 11f)
+            if (maxWidth <= 0f) return@forEachIndexed
+            val rowLeft = center - maxWidth / 2f
+            val rowRight = center + maxWidth / 2f
+
+            dotPaint.color = item.accentColor
+            canvas.drawCircle(rowLeft + 5f, baseline - 4f, 4f, dotPaint)
+
+            namePaint.color = item.accentColor
+            val safeName = ellipsizeText(item.appName, namePaint, maxWidth * 0.38f)
+            val nameX = rowLeft + 15f
+            canvas.drawText(safeName, nameX, baseline, namePaint)
+
+            val titleX = nameX + namePaint.measureText(safeName) + 6f
+            val titleMaxWidth = rowRight - titleX
+            if (titleMaxWidth > 10f && item.title.isNotBlank()) {
+                canvas.drawText(ellipsizeText(item.title, titlePaint, titleMaxWidth), titleX, baseline, titlePaint)
+            }
+        }
+
+        if (notifications.size > 3) {
+            val footerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.rgb(140, 165, 195)
+                textSize = 9.5f
+                textAlign = Paint.Align.CENTER
+            }
+            canvas.drawText("全 ${notifications.size} 件", center, 223f, footerPaint)
+        }
     }
 
     private fun getBatteryInfo(): Pair<Int, Boolean> {
