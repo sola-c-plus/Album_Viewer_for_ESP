@@ -803,12 +803,14 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     // スタンバイ画面下部に表示する「溜まっている通知」1件分の表示データ。
+    // iconBitmap は最新の1件 (リスト先頭) のみ、時計右横の小アイコン表示用に保持する。
     private data class StandbyNotificationItem(
         val appName: String,
         val title: String,
         val accentColor: Int,
         val keyHash: Int,
-        val postTime: Long
+        val postTime: Long,
+        val iconBitmap: Bitmap? = null
     )
 
     /**
@@ -825,14 +827,21 @@ class MediaListenerService : NotificationListenerService() {
             val items = notifications
                 .filter { isStandbyListTarget(it) }
                 .sortedByDescending { it.postTime }
-                .map { sbn ->
+                .mapIndexed { index, sbn ->
                     val extras = sbn.notification.extras
                     StandbyNotificationItem(
                         appName = getAppDisplayName(sbn.packageName),
                         title = extractTitle(null, extras).ifBlank { extractArtist(null, extras) },
                         accentColor = getAppAccentColor(sbn.packageName),
                         keyHash = sbn.key.hashCode(),
-                        postTime = sbn.postTime
+                        postTime = sbn.postTime,
+                        // アイコンは時計右横に描く最新の1件分だけ取得する
+                        // (全件分を毎回読み込むと監視ループの負荷になるため)。
+                        iconBitmap = if (index == 0) {
+                            getAppIconBitmap(sbn.packageName, sbn.notification)
+                        } else {
+                            null
+                        }
                     )
                 }
             val digest = if (items.isEmpty()) {
@@ -1527,6 +1536,26 @@ class MediaListenerService : NotificationListenerService() {
             canvas.drawPath(bolt, boltPaint)
         }
         canvas.drawText(pctStr, terminalLeft + terminalW + iconTextGap, battBaseline, pctPaint)
+
+        // 最新の通知のアプリアイコンを、時刻の右側の余白に小さく描く。
+        // 時刻 "HH:mm" (44f 太字) の実測幅は約110pxで右端は x≈175。
+        // アイコンは 30×30 を x=184–214 / y=73–103 に置く: 中心 (120,120) から
+        // 最も遠い角 (214,73) までの距離は約105で、装飾リング (r=112) の
+        // 内側に収まる。縦中心 (y=88) は時刻の字面の中心 (baseline 104 −
+        // cap height 約31 の半分 ≒ 88.5) に合わせた。日付行 (y≤50)・
+        // バッテリー行 (y≥127)・通知リスト (baseline 170〜) とは重ならない。
+        // 0件のとき、またはアイコンが取得できない通知 (null) のときは
+        // 描かない (ポップアップ描画と同じ流儀)。
+        val latestIcon = notifications.firstOrNull()?.iconBitmap
+        if (latestIcon != null) {
+            val appIconSize = 30f
+            val appIconLeft = 184f
+            val appIconTop = timeBaseline - 31f
+            val scaledIcon = Bitmap.createScaledBitmap(
+                latestIcon, appIconSize.toInt(), appIconSize.toInt(), true
+            )
+            canvas.drawBitmap(scaledIcon, appIconLeft, appIconTop, null)
+        }
 
         // 溜まっている通知のリスト (最大3件)。0件のときは何も描かず、
         // 時計ブロックだけの従来表示と完全に同じ見た目になる。
