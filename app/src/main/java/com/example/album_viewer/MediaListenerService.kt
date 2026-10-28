@@ -3,6 +3,7 @@ package com.example.album_viewer
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.ContentUris
 import android.content.Context
@@ -108,6 +109,27 @@ class MediaListenerService : NotificationListenerService() {
     // 分・電池%が変わらなくても、通知の増減だけで再送条件を立てるために使う。
     private var lastSentNotificationDigest = ""
 
+    // 充電開始/終了 (USB の抜き差し) を検知したときに立てる、スタンバイ再評価の
+    // 要求フラグ。監視ループの再送条件 (分・電池%・通知) だけでは充電状態のみの
+    // 変化を拾えず、次の分境界まで表示反映が遅れてしまうため、電源レシーバが
+    // このフラグを立て、監視ループ (updateActiveMedia) のスタンバイ分岐で
+    // 消費して sendStandbyDashboard を回す。実際の送信要否は署名 (充電状態を
+    // 含む) で決まるため、状態が変わっていなければ二重送信にはならない。
+    @Volatile
+    private var standbyRefreshRequested = false
+
+    private val powerConnectionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            // 待機画面を表示中で、ポップアップ表示中でないときだけ即時反映する。
+            // 再生中はスタンバイ送信自体が不要で、ポップアップ中は解除後の
+            // 復帰送信 (署名クリア経由) で最新のバッテリー状態が反映されるため、
+            // それ以外では従来経路に任せて余計な送信をしない。
+            if (isShowingNotificationPopup || !isStandbyScreenActive) return
+            standbyRefreshRequested = true
+            triggerUpdateDirect()
+        }
+    }
+
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         registerControllerCallbacks(controllers)
         triggerUpdateWithDebounce(200)
@@ -117,6 +139,17 @@ class MediaListenerService : NotificationListenerService() {
         super.onCreate()
         BluetoothSppManager.init(applicationContext)
         startForegroundNotification()
+        // 充電開始/終了で待機画面のバッテリー表示を即時反映する。
+        // ACTION_POWER_CONNECTED / DISCONNECTED はシステムブロードキャストの
+        // ため、コンテキスト登録レシーバでそのまま受けられる。
+        try {
+            registerReceiver(powerConnectionReceiver, IntentFilter().apply {
+                addAction(Intent.ACTION_POWER_CONNECTED)
+                addAction(Intent.ACTION_POWER_DISCONNECTED)
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register power connection receiver", e)
+        }
     }
 
     private fun startForegroundNotification() {
@@ -208,6 +241,11 @@ class MediaListenerService : NotificationListenerService() {
         popupDismissJob?.cancel()
         artworkRetryJob?.cancel()
         unregisterAllCallbacks()
+        try {
+            unregisterReceiver(powerConnectionReceiver)
+        } catch (e: Exception) {
+            // 未登録だった場合などは無視する
+        }
         sessionManager?.removeOnActiveSessionsChangedListener(sessionListener)
     }
 
@@ -726,9 +764,14 @@ class MediaListenerService : NotificationListenerService() {
                     // 分・電池%の変化に加え、溜まっている通知の増減でも再送する。
                     // 署名にもダイジェストが入っているため、内容が同じなら
                     // sendStandbyDashboard 側で重複送信として抑止される。
+                    // 充電開始/終了 (電源レシーバ) からの明示要求もここで消費する。
+                    // 充電状態は署名に含まれるため、実際に変わっていれば再送され、
+                    // 変わっていなければ署名ガードで抑止される。
+                    val powerRefreshRequested = standbyRefreshRequested
+                    standbyRefreshRequested = false
                     val notifDigest = buildStandbyNotificationState().second
                     if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5 ||
-                        notifDigest != lastSentNotificationDigest
+                        notifDigest != lastSentNotificationDigest || powerRefreshRequested
                     ) {
                         sendStandbyDashboard(cal, batteryPct, isCharging)
                     }
@@ -1382,6 +1425,14 @@ class MediaListenerService : NotificationListenerService() {
         }
         canvas.drawCircle(120f, 120f, 112f, ringPaint)
 
+        // 時計ブロック (日付・時刻・バッテリー行) の縦配置。
+        // 通知があるときは下部のリストに場所を譲るため上寄せ (シフトなし) にし、
+        // 通知が無いときはブロック全体を 28px 下げて円の中心付近に重心を
+        // 持ってくる (0件時に下半分が間延びして見えるのを防ぐ)。
+        val clockShiftY = if (notifications.isEmpty()) 28f else 0f
+        val dateBaseline = 50f + clockShiftY
+        val timeBaseline = 104f + clockShiftY
+
         val dateStr = SimpleDateFormat("MM/dd EEE", Locale.US).format(cal.time).uppercase()
         val datePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(140, 165, 195)
@@ -1389,71 +1440,72 @@ class MediaListenerService : NotificationListenerService() {
             typeface = Typeface.DEFAULT_BOLD
             textAlign = Paint.Align.CENTER
         }
-        canvas.drawText(dateStr, 120f, 50f, datePaint)
+        canvas.drawText(dateStr, 120f, dateBaseline, datePaint)
 
         val timeStr = SimpleDateFormat("HH:mm", Locale.US).format(cal.time)
         val timePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
-            textSize = 40f
+            textSize = 44f
             typeface = Typeface.DEFAULT_BOLD
             textAlign = Paint.Align.CENTER
         }
-        canvas.drawText(timeStr, 120f, 102f, timePaint)
+        canvas.drawText(timeStr, 120f, timeBaseline, timePaint)
 
-        // バッテリー行 (baseline 136、配置は現行維持)。絵文字文字列ではなく、
-        // Canvas 図形で描いた電池アイコン＋%表示に置き換える。
+        // バッテリー行。絵文字文字列ではなく、Canvas 図形で描いた電池
+        // アイコン＋%表示にする。時刻 (44f) が主役になるよう、アイコンは
+        // 一回り小さく (24×13) し、% も 12.5f に抑える。
         // アイコンと%をひと組として実測幅でセンタリングする。
         val battColor = when {
             isCharging -> Color.rgb(52, 199, 89)
             batteryPct <= 20 -> Color.rgb(255, 69, 58)
             else -> Color.rgb(0, 210, 255)
         }
-        val battBaseline = 136f
+        val battBaseline = 138f + clockShiftY
         val pctStr = "$batteryPct%"
         val pctPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = battColor
-            textSize = 14f
+            textSize = 12.5f
             typeface = Typeface.DEFAULT_BOLD
             textAlign = Paint.Align.LEFT
         }
         val pctWidth = pctPaint.measureText(pctStr)
 
-        val iconBodyW = 30f
-        val iconBodyH = 16f
-        val terminalGap = 2f
-        val terminalW = 3.5f
-        val iconTextGap = 7f
+        val iconBodyW = 24f
+        val iconBodyH = 13f
+        val terminalGap = 1.5f
+        val terminalW = 3f
+        val iconTextGap = 6f
         val battGroupWidth = iconBodyW + terminalGap + terminalW + iconTextGap + pctWidth
         val iconLeft = 120f - battGroupWidth / 2f
-        // アイコンの縦中心を % の字面の中心 (baseline の約5px上) に合わせる
-        val iconTop = battBaseline - 5f - iconBodyH / 2f
+        // アイコンの縦中心を % の字面の中心 (baseline の約4.5px上) に合わせる
+        val iconTop = battBaseline - 4.5f - iconBodyH / 2f
         val iconBottom = iconTop + iconBodyH
 
         val battStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = battColor
             style = Paint.Style.STROKE
-            strokeWidth = 1.8f
+            strokeWidth = 1.5f
         }
         val battFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = battColor
             style = Paint.Style.FILL
         }
         // 電池の枠 (角丸矩形)
-        canvas.drawRoundRect(RectF(iconLeft, iconTop, iconLeft + iconBodyW, iconBottom), 4f, 4f, battStrokePaint)
+        canvas.drawRoundRect(RectF(iconLeft, iconTop, iconLeft + iconBodyW, iconBottom), 3.5f, 3.5f, battStrokePaint)
         // 端子突起
         val terminalLeft = iconLeft + iconBodyW + terminalGap
         canvas.drawRoundRect(
-            RectF(terminalLeft, iconTop + 4f, terminalLeft + terminalW, iconBottom - 4f),
+            RectF(terminalLeft, iconTop + 3.5f, terminalLeft + terminalW, iconBottom - 3.5f),
             1.5f, 1.5f, battFillPaint
         )
         // 残量フィル (枠の内側を残量比で塗る)
-        val fillInset = 3f
+        val fillInset = 2.5f
         val fillMaxWidth = iconBodyW - fillInset * 2f
         val fillWidth = fillMaxWidth * batteryPct.coerceIn(0, 100) / 100f
         if (fillWidth > 0f) {
             canvas.drawRoundRect(
                 RectF(iconLeft + fillInset, iconTop + fillInset, iconLeft + fillInset + fillWidth, iconBottom - fillInset),
-                2f, 2f, battFillPaint
+                1.8f, 1.8f, battFillPaint
             )
         }
         // 充電時は電池アイコンの中央に白い稲妻を描く
@@ -1464,12 +1516,12 @@ class MediaListenerService : NotificationListenerService() {
                 style = Paint.Style.FILL
             }
             val bolt = Path().apply {
-                moveTo(iconLeft + 17.5f, iconTop + 1.5f)
-                lineTo(iconLeft + 11.0f, iconTop + 9.5f)
-                lineTo(iconLeft + 14.8f, iconTop + 9.5f)
-                lineTo(iconLeft + 12.5f, iconTop + 14.5f)
-                lineTo(iconLeft + 19.5f, iconTop + 6.0f)
-                lineTo(iconLeft + 15.7f, iconTop + 6.0f)
+                moveTo(iconLeft + 14.0f, iconTop + 1.2f)
+                lineTo(iconLeft + 8.8f, iconTop + 7.7f)
+                lineTo(iconLeft + 11.8f, iconTop + 7.7f)
+                lineTo(iconLeft + 10.0f, iconTop + 11.8f)
+                lineTo(iconLeft + 15.6f, iconTop + 4.9f)
+                lineTo(iconLeft + 12.6f, iconTop + 4.9f)
                 close()
             }
             canvas.drawPath(bolt, boltPaint)
