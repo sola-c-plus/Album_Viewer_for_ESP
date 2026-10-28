@@ -68,6 +68,10 @@ class MediaListenerService : NotificationListenerService() {
         // STANDBY_ROTATION_INTERVAL_MS を変更する。
         private const val STANDBY_PAGE_SIZE = 3
         private const val STANDBY_ROTATION_INTERVAL_MS = 5000L
+        // 処理済み通知の「本文だけの内容更新」を再ポップアップするまでの間隔。
+        // Gmail のバンドルのように同一キーが頻繁に更新される通知で、更新のたびに
+        // ポップアップが連発しないようにするためのクールダウン。
+        private const val NOTIFICATION_UPDATE_COOLDOWN_MS = 60_000L
     }
 
     private var sessionManager: MediaSessionManager? = null
@@ -79,7 +83,17 @@ class MediaListenerService : NotificationListenerService() {
     private val isUpdating = AtomicBoolean(false)
 
     private val activeControllers = ConcurrentHashMap<MediaController, MediaController.Callback>()
-    private val handledNotificationKeys = LruCache<String, Long>(300)
+    // ポップアップ表示済みの通知の記録。キー (sbn.key) ごとに、表示した時点の
+    // 内容ハッシュ・タイトルハッシュ・表示時刻を持つ。同一通知が後から内容を
+    // 更新して再ポストされた場合に「新しい内容か」を判定するために使う
+    // (shouldShowNotificationPopup 参照)。
+    private data class HandledNotification(
+        val contentHash: Int,
+        val titleHash: Int,
+        val shownAtMs: Long
+    )
+
+    private val handledNotifications = LruCache<String, HandledNotification>(300)
     // 容量は件数ではなくバイト基準（上限12MB）。実寸 Bitmap を多数保持して
     // 低メモリ時のプロセス kill を誘発しないよう、sizeOf で byteCount を数える。
     private val artworkCache = object : LruCache<String, Bitmap>(12 * 1024 * 1024) {
@@ -327,7 +341,7 @@ class MediaListenerService : NotificationListenerService() {
 
     /**
      * 通知シェード全体を走査し、onNotificationPosted で取りこぼした通知を拾う。
-     * 対象判定と重複防止は shouldShowNotificationPopup / handledNotificationKeys をそのまま再利用する。
+     * 対象判定と重複防止は shouldShowNotificationPopup / handledNotifications をそのまま再利用する。
      * リスナー未接続の隙間や再接続直後にポストされた通知が対象。
      */
     private fun sweepMissedNotifications() {
@@ -341,7 +355,11 @@ class MediaListenerService : NotificationListenerService() {
                 // 古い通知が重複防止キャッシュから追い出された後に「新規」と判定されて
                 // 再ポップアップするのを防ぎ、無駄な走査も抑える。
                 // onNotificationPosted 経由の通常ポップアップにはこの時間制限は付けない。
-                if (System.currentTimeMillis() - sbn.postTime > 15 * 60 * 1000L) continue
+                // ただし「処理済みキーの未表示の内容更新」は postTime が古いままでも
+                // 新しい情報なので、この時間制限の対象から外す。
+                if (System.currentTimeMillis() - sbn.postTime > 15 * 60 * 1000L &&
+                    !hasUnhandledContentUpdate(sbn)
+                ) continue
                 if (shouldShowNotificationPopup(sbn)) {
                     Log.d(TAG, "Sweep picked up missed notification: ${sbn.packageName}")
                     handleNotificationPopup(sbn)
@@ -359,8 +377,9 @@ class MediaListenerService : NotificationListenerService() {
 
     /**
      * 初回接続時に、既に通知シェードにある通知を「処理済み」として登録だけする。
-     * shouldShowNotificationPopup は true を返す対象について handledNotificationKeys へ
-     * キーを登録するため、戻り値を捨てて呼び出すことで古い通知の一斉ポップアップを防ぐ。
+     * shouldShowNotificationPopup は true を返す対象について handledNotifications へ
+     * 内容を登録するため、戻り値を捨てて呼び出すことで古い通知の一斉ポップアップを防ぐ。
+     * 登録後にその通知が内容を更新すれば、更新分は通常の更新判定で拾われる。
      */
     private fun primeExistingNotifications() {
         try {
@@ -374,6 +393,25 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
+    /**
+     * ポップアップ／待機リスト共通の対象アプリ判定 (引数は小文字化済みのパッケージ名)。
+     * Gmail の実際のパッケージ名は com.google.android.gm で、"gmail" にも "mail" にも
+     * 部分一致しないため、完全一致で明示的に対象に含める ("android.gm" の部分一致は
+     * com.google.android.gms (Play 開発者サービス) にも一致してしまうため使わない)。
+     * 以前はこの条件がポップアップ側と待機側で二重管理され、両方とも Gmail を
+     * 取りこぼしていたため、一箇所に共通化して管理する。
+     */
+    private fun isTargetAppPackage(pkg: String): Boolean {
+        if (pkg == "com.google.android.gm") return true
+        return pkg.contains("line") || pkg.contains("discord") ||
+               pkg.contains("dialer") || pkg.contains("telecom") ||
+               pkg.contains("messaging") || pkg.contains("mms") ||
+               pkg.contains("twitter") || pkg.contains("instagram") ||
+               pkg.contains("slack") || pkg.contains("whatsapp") ||
+               pkg.contains("gmail") || pkg.contains("mail") ||
+               pkg.contains("facebook.aura")
+    }
+
     private fun shouldShowNotificationPopup(sbn: StatusBarNotification): Boolean {
         if (sbn.packageName == packageName) return false
         if (sbn.isOngoing) return false
@@ -382,25 +420,53 @@ class MediaListenerService : NotificationListenerService() {
         val extras = notif.extras ?: return false
         if (extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) return false
 
-        val pkg = sbn.packageName.lowercase()
-        val isTargetApp = pkg.contains("line") || pkg.contains("discord") ||
-                          pkg.contains("dialer") || pkg.contains("telecom") ||
-                          pkg.contains("messaging") || pkg.contains("mms") ||
-                          pkg.contains("twitter") || pkg.contains("instagram") ||
-                          pkg.contains("slack") || pkg.contains("whatsapp") ||
-                          pkg.contains("gmail") || pkg.contains("mail") ||
-                          pkg.contains("facebook.aura")
-
-        if (!isTargetApp) return false
+        if (!isTargetAppPackage(sbn.packageName.lowercase())) return false
 
         val title = extractTitle(null, extras)
         val text = extractArtist(null, extras)
         if (title.isBlank() && text.isBlank()) return false
 
-        val notifKey = "${sbn.key}_${sbn.postTime}"
-        if (handledNotificationKeys.get(notifKey) != null) return false
-        handledNotificationKeys.put(notifKey, System.currentTimeMillis())
-        return true
+        // 重複防止は「通知キー」単独ではなく「通知キー＋内容」で判定する。
+        // Gmail のように既存通知を同じキーで更新し続けるアプリでは、更新の
+        // 再ポストでもキーと postTime が変わらないため、キーだけの判定だと
+        // 初回以降の新しい内容がすべて処理済みに埋もれてしまう。
+        val contentHash = (title + "\u0000" + text).hashCode()
+        val titleHash = title.hashCode()
+        val now = System.currentTimeMillis()
+        val handled = handledNotifications.get(sbn.key)
+        if (handled == null) {
+            handledNotifications.put(sbn.key, HandledNotification(contentHash, titleHash, now))
+            return true
+        }
+        if (handled.contentHash == contentHash) return false
+        // ここからは「表示済み通知の内容更新」。更新のたびにポップアップが
+        // 連発しないよう、見出し (タイトル) が変わった更新だけを即時に通し、
+        // 本文だけの変化は同一キーにつきクールダウンを空けて通す。
+        // クールダウンで抑止した更新は記録を書き換えないため、後続の再ポストや
+        // スイープで改めて評価される (その時点でクールダウンを過ぎていれば通る)。
+        if (handled.titleHash != titleHash ||
+            now - handled.shownAtMs >= NOTIFICATION_UPDATE_COOLDOWN_MS
+        ) {
+            handledNotifications.put(sbn.key, HandledNotification(contentHash, titleHash, now))
+            return true
+        }
+        return false
+    }
+
+    /**
+     * 処理済みのキーについて、まだ表示していない内容更新が来ているかを
+     * 副作用なしで調べる。スイープの15分制限の例外判定に使う。
+     * 対象アプリ判定などは呼び出し側 (shouldShowNotificationPopup) で改めて行うため、
+     * ここでは記録の有無と内容ハッシュの差だけを見る。
+     */
+    private fun hasUnhandledContentUpdate(sbn: StatusBarNotification): Boolean {
+        val handled = handledNotifications.get(sbn.key) ?: return false
+        val notif = sbn.notification ?: return false
+        val extras = notif.extras ?: return false
+        val title = extractTitle(null, extras)
+        val text = extractArtist(null, extras)
+        if (title.isBlank() && text.isBlank()) return false
+        return handled.contentHash != (title + "\u0000" + text).hashCode()
     }
 
     private fun handleNotificationPopup(sbn: StatusBarNotification) {
@@ -831,7 +897,8 @@ class MediaListenerService : NotificationListenerService() {
     // iconBitmap は全件分、行頭アイコン表示用に保持する (ローテーションで
     // 2ページ目以降の行にも必要なため)。
     // text は通知の本文。title が空で text を title に流用した場合は重複表示を
-    // 避けるため空にし、ダイジェスト (件数・先頭 keyHash・postTime) には含めない。
+    // 避けるため空にする。title / text はダイジェストの内容ハッシュに含める
+    // (buildStandbyNotificationState 参照)。
     private data class StandbyNotificationItem(
         val appName: String,
         val title: String,
@@ -845,7 +912,7 @@ class MediaListenerService : NotificationListenerService() {
     /**
      * シェードに溜まっている通知を、スタンバイ画面のリスト表示用に収集する。
      * 対象判定は副作用のない専用フィルタ (isStandbyListTarget) で行う。
-     * shouldShowNotificationPopup は handledNotificationKeys への登録という
+     * shouldShowNotificationPopup は handledNotifications への登録という
      * 副作用があるため、リスト生成に流用するとポップアップの重複防止が壊れる。
      * 戻り値は (表示用リスト [新しい順], 通知ダイジェスト)。
      * ダイジェストはスタンバイ署名と再送条件に使い、通知の増減を検知する。
@@ -874,13 +941,24 @@ class MediaListenerService : NotificationListenerService() {
                         iconBitmap = getAppIconBitmap(sbn.packageName, sbn.notification)
                     )
                 }
+            // ダイジェストは件数だけでなく、各行の内容 (キー・タイトル・本文) の
+            // ハッシュも含める。Gmail のように既存通知を同じキー・同じ postTime の
+            // まま内容だけ更新するアプリでは、件数と先頭キーだけのダイジェストだと
+            // 更新が検知されず、スタンバイ画面に新しい内容が反映されないため。
             val digest = if (items.isEmpty()) {
                 "n0"
             } else {
-                "n${items.size}_${items.first().keyHash}_${items.first().postTime}"
+                var contentHash = items.size
+                for (item in items) {
+                    contentHash = 31 * contentHash + item.keyHash
+                    contentHash = 31 * contentHash + item.title.hashCode()
+                    contentHash = 31 * contentHash + item.text.hashCode()
+                }
+                "n${items.size}_$contentHash"
             }
             // ローテーションのページ決定用に、ダイジェストが最後に変わった
-            // 時刻を記録する (定義自体は従来どおり)。
+            // 時刻を記録する (内容ハッシュ込みの現行定義で判定するため、
+            // 内容だけの更新でもダイジェストが変わり、1ページ目から再開される)。
             if (digest != lastObservedStandbyDigest) {
                 lastObservedStandbyDigest = digest
                 standbyDigestChangedAtMs = System.currentTimeMillis()
@@ -909,7 +987,7 @@ class MediaListenerService : NotificationListenerService() {
 
     // スタンバイのリスト表示専用の対象判定 (副作用なし)。
     // 対象アプリの集合と基本的な除外条件はポップアップ側と揃えるが、
-    // handledNotificationKeys には一切触れない。
+    // handledNotifications には一切触れない。
     private fun isStandbyListTarget(sbn: StatusBarNotification): Boolean {
         if (sbn.packageName == packageName) return false
         if (sbn.isOngoing) return false
@@ -919,16 +997,7 @@ class MediaListenerService : NotificationListenerService() {
         val extras = notif.extras ?: return false
         if (extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) return false
 
-        val pkg = sbn.packageName.lowercase()
-        val isTargetApp = pkg.contains("line") || pkg.contains("discord") ||
-                          pkg.contains("dialer") || pkg.contains("telecom") ||
-                          pkg.contains("messaging") || pkg.contains("mms") ||
-                          pkg.contains("twitter") || pkg.contains("instagram") ||
-                          pkg.contains("slack") || pkg.contains("whatsapp") ||
-                          pkg.contains("gmail") || pkg.contains("mail") ||
-                          pkg.contains("facebook.aura")
-
-        if (!isTargetApp) return false
+        if (!isTargetAppPackage(sbn.packageName.lowercase())) return false
 
         val title = extractTitle(null, extras)
         val text = extractArtist(null, extras)
@@ -950,8 +1019,7 @@ class MediaListenerService : NotificationListenerService() {
         // コールバックが後からコミットしてしまい、復帰送信が抑止される）。
         val (standbyNotifs, notifDigest) = buildStandbyNotificationState()
         // ページローテーション: ページ番号も署名に含めることで、ページが
-        // 切り替わったときだけ再描画・再送される (ダイジェスト自体の定義は
-        // 従来どおりで、3件以下ではページは常に 0)。
+        // 切り替わったときだけ再描画・再送される (3件以下ではページは常に 0)。
         val rotationPage = currentStandbyPage(standbyNotifs.size)
         val signature = "${cal.get(Calendar.DAY_OF_YEAR)}_${cal.get(Calendar.HOUR_OF_DAY)}_" +
             "${cal.get(Calendar.MINUTE)}_${batteryPct}_$isCharging" + "_$notifDigest" + "_pg$rotationPage"
@@ -1338,6 +1406,7 @@ class MediaListenerService : NotificationListenerService() {
         }
         extras?.let {
             it.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            it.getCharSequence(Notification.EXTRA_TITLE_BIG)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
         }
         return ""
     }
@@ -1353,6 +1422,12 @@ class MediaListenerService : NotificationListenerService() {
         extras?.let {
             it.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
             it.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            // InboxStyle (Gmail のバンドル通知等) では、本文が EXTRA_TEXT_LINES に
+            // しか無い場合がある。先頭行 (最新のメール) を本文として使う。
+            it.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+                ?.firstOrNull { line -> !line.isNullOrBlank() }?.toString()?.let { return it }
+            it.getCharSequence(Notification.EXTRA_SUMMARY_TEXT)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
+            it.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()?.takeIf { s -> s.isNotBlank() }?.let { return it }
         }
         return ""
     }
