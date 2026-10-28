@@ -18,6 +18,8 @@ import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
@@ -804,9 +806,12 @@ class MediaListenerService : NotificationListenerService() {
 
     // スタンバイ画面下部に表示する「溜まっている通知」1件分の表示データ。
     // iconBitmap はリストに表示する最大3件分のみ、行頭アイコン表示用に保持する。
+    // text は通知の本文。title が空で text を title に流用した場合は重複表示を
+    // 避けるため空にし、ダイジェスト (件数・先頭 keyHash・postTime) には含めない。
     private data class StandbyNotificationItem(
         val appName: String,
         val title: String,
+        val text: String,
         val accentColor: Int,
         val keyHash: Int,
         val postTime: Long,
@@ -829,9 +834,14 @@ class MediaListenerService : NotificationListenerService() {
                 .sortedByDescending { it.postTime }
                 .mapIndexed { index, sbn ->
                     val extras = sbn.notification.extras
+                    val notifTitle = extractTitle(null, extras)
+                    val notifText = extractArtist(null, extras)
                     StandbyNotificationItem(
                         appName = getAppDisplayName(sbn.packageName),
-                        title = extractTitle(null, extras).ifBlank { extractArtist(null, extras) },
+                        title = notifTitle.ifBlank { notifText },
+                        // title が空で本文を流用した場合は、同じ文字列を
+                        // 名前と本文で二重に出さないよう本文を空にする。
+                        text = if (notifTitle.isBlank()) "" else notifText,
                         accentColor = getAppAccentColor(sbn.packageName),
                         keyHash = sbn.key.hashCode(),
                         postTime = sbn.postTime,
@@ -1547,22 +1557,26 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     // スタンバイ画面下部 (y≈156–212) に通知リストを描く。
-    // 各行はアプリアイコン (16×16、取得できない行はアプリ色ドット) ＋
-    // アプリ名 (太字・アプリ色) ＋タイトル (薄色) で、行ごとの円の
-    // 弦幅に収まるようタイトルを省略する。
+    // 各行は「アプリ色に着色したアプリアイコン (16×16、取得できない行は
+    // アプリ色ドット) ＋名前 (最大8文字程度に切り詰め) ＋本文」で、
+    // アプリ名の文字列は出さず、アイコンの色と形でアプリを識別させる。
+    // 行ごとの円の弦幅に収まるよう、本文は末尾を省略する。
     // 4件以上ある場合は3件表示し、最下部に「全 N 件」のフッタを置く。
     private fun drawStandbyNotificationList(canvas: Canvas, notifications: List<StandbyNotificationItem>) {
         val center = 120f
         val ringRadius = 112f
         val rowBaselines = floatArrayOf(170f, 188f, 206f)
 
+        // 名前は従来のタイトルと同じ明るい色で、行の先導要素として太字にする。
         val namePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(215, 220, 235)
             textSize = 11f
             typeface = Typeface.DEFAULT_BOLD
             textAlign = Paint.Align.LEFT
         }
-        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(215, 220, 235)
+        // 本文は名前より一段落とした色で添える。
+        val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(165, 175, 195)
             textSize = 11f
             textAlign = Paint.Align.LEFT
         }
@@ -1578,31 +1592,43 @@ class MediaListenerService : NotificationListenerService() {
             val rowRight = center + maxWidth / 2f
 
             // 行頭のスロット (rowLeft+1 〜 +17) にアプリアイコン (16×16) を
-            // 置く。縦中心は baseline − 4 (文字の字面の中心相当) に合わせる。
-            // 行間 18px に対して上下に 12/4px ずつはみ出すが、隣の行とは
-            // 重ならない。アイコンが取得できない行は、同じスロットの
-            // 中央にアプリ色ドット (r=4) を描いてフォールバックする。
+            // アプリ色に着色して置く。縦中心は baseline − 4 (文字の字面の
+            // 中心相当) に合わせる。行間 18px に対して上下に 12/4px ずつ
+            // はみ出すが、隣の行とは重ならない。アイコンが取得できない行は、
+            // 同じスロットの中央にアプリ色ドット (r=4) を描いてフォールバックする。
+            val iconSize = 16f
             val rowIcon = item.iconBitmap
             if (rowIcon != null) {
-                val iconSize = 16f
-                val scaledRowIcon = Bitmap.createScaledBitmap(
-                    rowIcon, iconSize.toInt(), iconSize.toInt(), true
+                canvas.drawBitmap(
+                    tintStandbyRowIcon(rowIcon, item.accentColor, iconSize.toInt()),
+                    rowLeft + 1f, baseline - 4f - iconSize / 2f, null
                 )
-                canvas.drawBitmap(scaledRowIcon, rowLeft + 1f, baseline - 4f - iconSize / 2f, null)
             } else {
                 dotPaint.color = item.accentColor
                 canvas.drawCircle(rowLeft + 9f, baseline - 4f, 4f, dotPaint)
             }
 
-            namePaint.color = item.accentColor
-            val safeName = ellipsizeText(item.appName, namePaint, maxWidth * 0.38f)
+            // 名前は最大8文字程度で切り詰め (長いサーバー名・チャンネル名対策)、
+            // さらに本文の表示領域を残すためテキスト領域の 60% をピクセル上限とする。
             val nameX = rowLeft + 21f
-            canvas.drawText(safeName, nameX, baseline, namePaint)
+            val safeName = truncateStandbyName(
+                item.title, namePaint, (rowRight - nameX) * 0.6f
+            )
+            if (safeName.isNotEmpty()) {
+                canvas.drawText(safeName, nameX, baseline, namePaint)
+            }
 
-            val titleX = nameX + namePaint.measureText(safeName) + 6f
-            val titleMaxWidth = rowRight - titleX
-            if (titleMaxWidth > 10f && item.title.isNotBlank()) {
-                canvas.drawText(ellipsizeText(item.title, titlePaint, titleMaxWidth), titleX, baseline, titlePaint)
+            val bodyX = if (safeName.isEmpty()) {
+                nameX
+            } else {
+                nameX + namePaint.measureText(safeName) + 6f
+            }
+            val bodyMaxWidth = rowRight - bodyX
+            if (bodyMaxWidth > 10f && item.text.isNotBlank()) {
+                canvas.drawText(
+                    ellipsizeText(item.text, bodyPaint, bodyMaxWidth),
+                    bodyX, baseline, bodyPaint
+                )
             }
         }
 
@@ -1614,6 +1640,46 @@ class MediaListenerService : NotificationListenerService() {
             }
             canvas.drawText("全 ${notifications.size} 件", center, 223f, footerPaint)
         }
+    }
+
+    // 名前を最大8文字程度に切り詰める。8文字を超える場合は末尾に「…」を
+    // 付け、サロゲートペアの途中で割れないよう配慮する。文字数で収まった
+    // 後も、呼び出し側のピクセル上限 (maxWidth) で最終的に切り詰める
+    // (全角文字は1文字あたりの幅が広く、8文字でも上限を超える行があるため)。
+    private fun truncateStandbyName(name: String, paint: Paint, maxWidth: Float): String {
+        var charLimited = name
+        if (name.length > 8) {
+            var cut = 8
+            if (Character.isHighSurrogate(name[cut - 1])) cut--
+            charLimited = name.take(cut) + "…"
+        }
+        return ellipsizeText(charLimited, paint, maxWidth)
+    }
+
+    // 行頭アイコンをアプリ色のシルエットに着色する。通知のスモールアイコンは
+    // 単色グリフ (透明背景) が前提のため、SRC_IN でグリフ形状のまま色を
+    // 差し替えられる。スモールアイコンが無く全面不透明なフルカラーの
+    // アプリアイコンしか得られなかった場合は、シルエット化すると識別性を
+    // 失うため、従来どおりそのまま (無着色で) 描く。
+    private fun tintStandbyRowIcon(source: Bitmap, color: Int, sizePx: Int): Bitmap {
+        val scaled = Bitmap.createScaledBitmap(source, sizePx, sizePx, true)
+        if (isFullyOpaqueBitmap(scaled)) return scaled
+        val tinted = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val tintCanvas = Canvas(tinted)
+        val tintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN)
+        }
+        tintCanvas.drawBitmap(scaled, 0f, 0f, tintPaint)
+        return tinted
+    }
+
+    private fun isFullyOpaqueBitmap(bitmap: Bitmap): Boolean {
+        for (y in 0 until bitmap.height) {
+            for (x in 0 until bitmap.width) {
+                if (Color.alpha(bitmap.getPixel(x, y)) < 255) return false
+            }
+        }
+        return true
     }
 
     private fun getBatteryInfo(): Pair<Int, Boolean> {
