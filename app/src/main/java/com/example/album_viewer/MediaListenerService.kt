@@ -803,7 +803,7 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     // スタンバイ画面下部に表示する「溜まっている通知」1件分の表示データ。
-    // iconBitmap は最新の1件 (リスト先頭) のみ、時計右横の小アイコン表示用に保持する。
+    // iconBitmap はリストに表示する最大3件分のみ、行頭アイコン表示用に保持する。
     private data class StandbyNotificationItem(
         val appName: String,
         val title: String,
@@ -835,9 +835,9 @@ class MediaListenerService : NotificationListenerService() {
                         accentColor = getAppAccentColor(sbn.packageName),
                         keyHash = sbn.key.hashCode(),
                         postTime = sbn.postTime,
-                        // アイコンは時計右横に描く最新の1件分だけ取得する
-                        // (全件分を毎回読み込むと監視ループの負荷になるため)。
-                        iconBitmap = if (index == 0) {
+                        // アイコンはリストに表示する最大3件分だけ取得する
+                        // (4件目以降は画面に出ないため読み込まない)。
+                        iconBitmap = if (index < 3) {
                             getAppIconBitmap(sbn.packageName, sbn.notification)
                         } else {
                             null
@@ -1537,26 +1537,6 @@ class MediaListenerService : NotificationListenerService() {
         }
         canvas.drawText(pctStr, terminalLeft + terminalW + iconTextGap, battBaseline, pctPaint)
 
-        // 最新の通知のアプリアイコンを、時刻の右側の余白に小さく描く。
-        // 時刻 "HH:mm" (44f 太字) の実測幅は約110pxで右端は x≈175。
-        // アイコンは 30×30 を x=184–214 / y=73–103 に置く: 中心 (120,120) から
-        // 最も遠い角 (214,73) までの距離は約105で、装飾リング (r=112) の
-        // 内側に収まる。縦中心 (y=88) は時刻の字面の中心 (baseline 104 −
-        // cap height 約31 の半分 ≒ 88.5) に合わせた。日付行 (y≤50)・
-        // バッテリー行 (y≥127)・通知リスト (baseline 170〜) とは重ならない。
-        // 0件のとき、またはアイコンが取得できない通知 (null) のときは
-        // 描かない (ポップアップ描画と同じ流儀)。
-        val latestIcon = notifications.firstOrNull()?.iconBitmap
-        if (latestIcon != null) {
-            val appIconSize = 30f
-            val appIconLeft = 184f
-            val appIconTop = timeBaseline - 31f
-            val scaledIcon = Bitmap.createScaledBitmap(
-                latestIcon, appIconSize.toInt(), appIconSize.toInt(), true
-            )
-            canvas.drawBitmap(scaledIcon, appIconLeft, appIconTop, null)
-        }
-
         // 溜まっている通知のリスト (最大3件)。0件のときは何も描かず、
         // 時計ブロックだけの従来表示と完全に同じ見た目になる。
         if (notifications.isNotEmpty()) {
@@ -1567,8 +1547,9 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     // スタンバイ画面下部 (y≈156–212) に通知リストを描く。
-    // 各行はアプリ色ドット＋アプリ名 (太字・アプリ色) ＋タイトル (薄色) で、
-    // 行ごとの円の弦幅に収まるようタイトルを省略する。
+    // 各行はアプリアイコン (16×16、取得できない行はアプリ色ドット) ＋
+    // アプリ名 (太字・アプリ色) ＋タイトル (薄色) で、行ごとの円の
+    // 弦幅に収まるようタイトルを省略する。
     // 4件以上ある場合は3件表示し、最下部に「全 N 件」のフッタを置く。
     private fun drawStandbyNotificationList(canvas: Canvas, notifications: List<StandbyNotificationItem>) {
         val center = 120f
@@ -1596,12 +1577,26 @@ class MediaListenerService : NotificationListenerService() {
             val rowLeft = center - maxWidth / 2f
             val rowRight = center + maxWidth / 2f
 
-            dotPaint.color = item.accentColor
-            canvas.drawCircle(rowLeft + 5f, baseline - 4f, 4f, dotPaint)
+            // 行頭のスロット (rowLeft+1 〜 +17) にアプリアイコン (16×16) を
+            // 置く。縦中心は baseline − 4 (文字の字面の中心相当) に合わせる。
+            // 行間 18px に対して上下に 12/4px ずつはみ出すが、隣の行とは
+            // 重ならない。アイコンが取得できない行は、同じスロットの
+            // 中央にアプリ色ドット (r=4) を描いてフォールバックする。
+            val rowIcon = item.iconBitmap
+            if (rowIcon != null) {
+                val iconSize = 16f
+                val scaledRowIcon = Bitmap.createScaledBitmap(
+                    rowIcon, iconSize.toInt(), iconSize.toInt(), true
+                )
+                canvas.drawBitmap(scaledRowIcon, rowLeft + 1f, baseline - 4f - iconSize / 2f, null)
+            } else {
+                dotPaint.color = item.accentColor
+                canvas.drawCircle(rowLeft + 9f, baseline - 4f, 4f, dotPaint)
+            }
 
             namePaint.color = item.accentColor
             val safeName = ellipsizeText(item.appName, namePaint, maxWidth * 0.38f)
-            val nameX = rowLeft + 15f
+            val nameX = rowLeft + 21f
             canvas.drawText(safeName, nameX, baseline, namePaint)
 
             val titleX = nameX + namePaint.measureText(safeName) + 6f
