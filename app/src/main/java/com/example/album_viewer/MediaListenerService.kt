@@ -378,6 +378,25 @@ class MediaListenerService : NotificationListenerService() {
         }
     }
 
+    /**
+     * ポップアップ／待機リスト共通の対象アプリ判定 (引数は小文字化済みのパッケージ名)。
+     * Gmail の実際のパッケージ名は com.google.android.gm で、"gmail" にも "mail" にも
+     * 部分一致しないため、完全一致で明示的に対象に含める ("android.gm" の部分一致は
+     * com.google.android.gms (Play 開発者サービス) にも一致してしまうため使わない)。
+     * 以前はこの条件がポップアップ側と待機側で二重管理され、両方とも Gmail を
+     * 取りこぼしていたため、一箇所に共通化して管理する。
+     */
+    private fun isTargetAppPackage(pkg: String): Boolean {
+        if (pkg == "com.google.android.gm") return true
+        return pkg.contains("line") || pkg.contains("discord") ||
+               pkg.contains("dialer") || pkg.contains("telecom") ||
+               pkg.contains("messaging") || pkg.contains("mms") ||
+               pkg.contains("twitter") || pkg.contains("instagram") ||
+               pkg.contains("slack") || pkg.contains("whatsapp") ||
+               pkg.contains("gmail") || pkg.contains("mail") ||
+               pkg.contains("facebook.aura")
+    }
+
     private fun shouldShowNotificationPopup(sbn: StatusBarNotification): Boolean {
         if (sbn.packageName == packageName) return false
         if (sbn.isOngoing) return false
@@ -386,16 +405,7 @@ class MediaListenerService : NotificationListenerService() {
         val extras = notif.extras ?: return false
         if (extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) return false
 
-        val pkg = sbn.packageName.lowercase()
-        val isTargetApp = pkg.contains("line") || pkg.contains("discord") ||
-                          pkg.contains("dialer") || pkg.contains("telecom") ||
-                          pkg.contains("messaging") || pkg.contains("mms") ||
-                          pkg.contains("twitter") || pkg.contains("instagram") ||
-                          pkg.contains("slack") || pkg.contains("whatsapp") ||
-                          pkg.contains("gmail") || pkg.contains("mail") ||
-                          pkg.contains("facebook.aura")
-
-        if (!isTargetApp) return false
+        if (!isTargetAppPackage(sbn.packageName.lowercase())) return false
 
         val title = extractTitle(null, extras)
         val text = extractArtist(null, extras)
@@ -945,16 +955,7 @@ class MediaListenerService : NotificationListenerService() {
         val extras = notif.extras ?: return false
         if (extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) return false
 
-        val pkg = sbn.packageName.lowercase()
-        val isTargetApp = pkg.contains("line") || pkg.contains("discord") ||
-                          pkg.contains("dialer") || pkg.contains("telecom") ||
-                          pkg.contains("messaging") || pkg.contains("mms") ||
-                          pkg.contains("twitter") || pkg.contains("instagram") ||
-                          pkg.contains("slack") || pkg.contains("whatsapp") ||
-                          pkg.contains("gmail") || pkg.contains("mail") ||
-                          pkg.contains("facebook.aura")
-
-        if (!isTargetApp) return false
+        if (!isTargetAppPackage(sbn.packageName.lowercase())) return false
 
         val title = extractTitle(null, extras)
         val text = extractArtist(null, extras)
