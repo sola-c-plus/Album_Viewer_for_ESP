@@ -63,6 +63,11 @@ class MediaListenerService : NotificationListenerService() {
         private const val TAG = "MediaListenerService"
         private const val CHANNEL_ID = "album_viewer_fg_channel"
         private const val NOTIF_ID = 9901
+        // 待機画面の通知リストのページローテーション (対象通知が
+        // STANDBY_PAGE_SIZE 件を超えたときだけ有効)。間隔を変えたい場合は
+        // STANDBY_ROTATION_INTERVAL_MS を変更する。
+        private const val STANDBY_PAGE_SIZE = 3
+        private const val STANDBY_ROTATION_INTERVAL_MS = 5000L
     }
 
     private var sessionManager: MediaSessionManager? = null
@@ -110,6 +115,16 @@ class MediaListenerService : NotificationListenerService() {
     // 最後に送信が成功したスタンバイ画面に含まれていた通知ダイジェスト。
     // 分・電池%が変わらなくても、通知の増減だけで再送条件を立てるために使う。
     private var lastSentNotificationDigest = ""
+
+    // 通知リストのページローテーション用。最後に観測したダイジェストと、
+    // それが最後に変わった時刻を保持する。現在のページは
+    // (現在時刻 − この時刻) から決まるため、新しい通知が来てダイジェストが
+    // 変わると自動的に1ページ目から再開される。
+    private var lastObservedStandbyDigest: String? = null
+    private var standbyDigestChangedAtMs = 0L
+    // 最後に送信が成功した待機画像のページ番号。分・電池・通知が変わらなく
+    // ても、ページ境界を跨いだら再送条件を立てるために使う。
+    private var lastSentStandbyPage = 0
 
     // 充電開始/終了 (USB の抜き差し) を検知したときに立てる、スタンバイ再評価の
     // 要求フラグ。監視ループの再送条件 (分・電池%・通知) だけでは充電状態のみの
@@ -760,6 +775,9 @@ class MediaListenerService : NotificationListenerService() {
                     // lastSentMinute / lastSentBatteryPct は sendStandbyDashboard 側で
                     // 転送成功時にコミットする (ここで先に進めると、転送失敗時に
                     // 分・電池の変化条件が消えて自己回復できなくなる)。
+                    // ローテーションは待機に入った時点を起点にし、常に
+                    // 1ページ目から始める。
+                    standbyDigestChangedAtMs = System.currentTimeMillis()
 
                     sendStandbyDashboard(cal, batteryPct, isCharging)
                 } else if (isStandbyScreenActive) {
@@ -771,9 +789,14 @@ class MediaListenerService : NotificationListenerService() {
                     // 変わっていなければ署名ガードで抑止される。
                     val powerRefreshRequested = standbyRefreshRequested
                     standbyRefreshRequested = false
-                    val notifDigest = buildStandbyNotificationState().second
+                    val (notifItems, notifDigest) = buildStandbyNotificationState()
+                    // 通知が4件以上あるときはページローテーションの境界でも
+                    // 再送する (ページが変われば署名も変わるため、実際の
+                    // 送信は sendStandbyDashboard の署名ガードで決まる)。
+                    val rotationPage = currentStandbyPage(notifItems.size)
                     if (currentMinute != lastSentMinute || Math.abs(batteryPct - lastSentBatteryPct) >= 5 ||
-                        notifDigest != lastSentNotificationDigest || powerRefreshRequested
+                        notifDigest != lastSentNotificationDigest || powerRefreshRequested ||
+                        rotationPage != lastSentStandbyPage
                     ) {
                         sendStandbyDashboard(cal, batteryPct, isCharging)
                     }
@@ -805,7 +828,8 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     // スタンバイ画面下部に表示する「溜まっている通知」1件分の表示データ。
-    // iconBitmap はリストに表示する最大3件分のみ、行頭アイコン表示用に保持する。
+    // iconBitmap は全件分、行頭アイコン表示用に保持する (ローテーションで
+    // 2ページ目以降の行にも必要なため)。
     // text は通知の本文。title が空で text を title に流用した場合は重複表示を
     // 避けるため空にし、ダイジェスト (件数・先頭 keyHash・postTime) には含めない。
     private data class StandbyNotificationItem(
@@ -845,13 +869,9 @@ class MediaListenerService : NotificationListenerService() {
                         accentColor = getAppAccentColor(sbn.packageName),
                         keyHash = sbn.key.hashCode(),
                         postTime = sbn.postTime,
-                        // アイコンはリストに表示する最大3件分だけ取得する
-                        // (4件目以降は画面に出ないため読み込まない)。
-                        iconBitmap = if (index < 3) {
-                            getAppIconBitmap(sbn.packageName, sbn.notification)
-                        } else {
-                            null
-                        }
+                        // アイコンは全件分を取得する (ローテーションで
+                        // 2ページ目以降の行にもアイコンが必要なため)。
+                        iconBitmap = getAppIconBitmap(sbn.packageName, sbn.notification)
                     )
                 }
             val digest = if (items.isEmpty()) {
@@ -859,11 +879,32 @@ class MediaListenerService : NotificationListenerService() {
             } else {
                 "n${items.size}_${items.first().keyHash}_${items.first().postTime}"
             }
+            // ローテーションのページ決定用に、ダイジェストが最後に変わった
+            // 時刻を記録する (定義自体は従来どおり)。
+            if (digest != lastObservedStandbyDigest) {
+                lastObservedStandbyDigest = digest
+                standbyDigestChangedAtMs = System.currentTimeMillis()
+            }
             Pair(items, digest)
         } catch (e: Exception) {
             Log.e(TAG, "Error building standby notification state", e)
             Pair(emptyList(), "n0")
         }
+    }
+
+    /**
+     * 現在表示すべき通知リストのページ番号 (0始まり)。
+     * [STANDBY_PAGE_SIZE] 件以下では常に 0 (ローテーションなし)。
+     * それより多い場合は、ダイジェストが最後に変わってからの経過時間を
+     * [STANDBY_ROTATION_INTERVAL_MS] で割ってページ数で循環させる。
+     * ページ状態そのものは保持しないため、プロセス再起動や待機の再入でも
+     * 決定は一貫する。
+     */
+    private fun currentStandbyPage(totalCount: Int): Int {
+        if (totalCount <= STANDBY_PAGE_SIZE) return 0
+        val pageCount = (totalCount + STANDBY_PAGE_SIZE - 1) / STANDBY_PAGE_SIZE
+        val elapsedMs = (System.currentTimeMillis() - standbyDigestChangedAtMs).coerceAtLeast(0L)
+        return ((elapsedMs / STANDBY_ROTATION_INTERVAL_MS) % pageCount).toInt()
     }
 
     // スタンバイのリスト表示専用の対象判定 (副作用なし)。
@@ -908,8 +949,12 @@ class MediaListenerService : NotificationListenerService() {
         // 行う。クリア対象には pending 側も含める（でないと送信中だった内容の
         // コールバックが後からコミットしてしまい、復帰送信が抑止される）。
         val (standbyNotifs, notifDigest) = buildStandbyNotificationState()
+        // ページローテーション: ページ番号も署名に含めることで、ページが
+        // 切り替わったときだけ再描画・再送される (ダイジェスト自体の定義は
+        // 従来どおりで、3件以下ではページは常に 0)。
+        val rotationPage = currentStandbyPage(standbyNotifs.size)
         val signature = "${cal.get(Calendar.DAY_OF_YEAR)}_${cal.get(Calendar.HOUR_OF_DAY)}_" +
-            "${cal.get(Calendar.MINUTE)}_${batteryPct}_$isCharging" + "_$notifDigest"
+            "${cal.get(Calendar.MINUTE)}_${batteryPct}_$isCharging" + "_$notifDigest" + "_pg$rotationPage"
         if (signature == lastSentStandbySignature || signature == pendingStandbySignature) {
             Log.d(TAG, "Skip duplicate standby dashboard: $signature")
             return
@@ -917,7 +962,7 @@ class MediaListenerService : NotificationListenerService() {
         pendingStandbySignature = signature
         val sentMinute = cal.get(Calendar.MINUTE)
 
-        val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240, standbyNotifs)
+        val dashboardBmp = drawStandbyDashboardBitmap(cal, batteryPct, isCharging, 240, standbyNotifs, rotationPage)
         val jpegBytes = compressToSafeBaselineJpeg(dashboardBmp)
 
         val title = "📱 SMART STANDBY"
@@ -940,6 +985,7 @@ class MediaListenerService : NotificationListenerService() {
                 lastSentMinute = sentMinute
                 lastSentBatteryPct = batteryPct
                 lastSentNotificationDigest = notifDigest
+                lastSentStandbyPage = rotationPage
             } else if (!success) {
                 Log.w(TAG, "Standby transfer failed, will retry on next update: $signature")
             }
@@ -1430,7 +1476,8 @@ class MediaListenerService : NotificationListenerService() {
         batteryPct: Int,
         isCharging: Boolean,
         size: Int = 240,
-        notifications: List<StandbyNotificationItem> = emptyList()
+        notifications: List<StandbyNotificationItem> = emptyList(),
+        notificationPage: Int = 0
     ): Bitmap {
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
         val canvas = Canvas(bmp)
@@ -1550,7 +1597,7 @@ class MediaListenerService : NotificationListenerService() {
         // 溜まっている通知のリスト (最大3件)。0件のときは何も描かず、
         // 時計ブロックだけの従来表示と完全に同じ見た目になる。
         if (notifications.isNotEmpty()) {
-            drawStandbyNotificationList(canvas, notifications)
+            drawStandbyNotificationList(canvas, notifications, notificationPage)
         }
 
         return bmp
@@ -1561,8 +1608,13 @@ class MediaListenerService : NotificationListenerService() {
     // アプリ色ドット) ＋名前 (最大8文字程度に切り詰め) ＋本文」で、
     // アプリ名の文字列は出さず、アイコンの色と形でアプリを識別させる。
     // 行ごとの円の弦幅に収まるよう、本文は末尾を省略する。
-    // 4件以上ある場合は3件表示し、最下部に「全 N 件」のフッタを置く。
-    private fun drawStandbyNotificationList(canvas: Canvas, notifications: List<StandbyNotificationItem>) {
+    // 4件以上ある場合は3件ずつのページに分け (ページは呼び出し側が
+    // ローテーションで決める)、最下部に「全 N 件 p/P」のフッタを置く。
+    private fun drawStandbyNotificationList(
+        canvas: Canvas,
+        notifications: List<StandbyNotificationItem>,
+        page: Int = 0
+    ) {
         val center = 120f
         val ringRadius = 112f
         val rowBaselines = floatArrayOf(170f, 188f, 206f)
@@ -1584,7 +1636,12 @@ class MediaListenerService : NotificationListenerService() {
             style = Paint.Style.FILL
         }
 
-        notifications.take(3).forEachIndexed { index, item ->
+        val pageCount = (notifications.size + STANDBY_PAGE_SIZE - 1) / STANDBY_PAGE_SIZE
+        val safePage = if (pageCount > 0) page.coerceIn(0, pageCount - 1) else 0
+        notifications
+            .drop(safePage * STANDBY_PAGE_SIZE)
+            .take(STANDBY_PAGE_SIZE)
+            .forEachIndexed { index, item ->
             val baseline = rowBaselines[index]
             val maxWidth = circleLineMaxWidth(center, ringRadius, baseline, 11f)
             if (maxWidth <= 0f) return@forEachIndexed
@@ -1632,13 +1689,19 @@ class MediaListenerService : NotificationListenerService() {
             }
         }
 
-        if (notifications.size > 3) {
+        if (notifications.size > STANDBY_PAGE_SIZE) {
             val footerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.rgb(140, 165, 195)
                 textSize = 9.5f
                 textAlign = Paint.Align.CENTER
             }
-            canvas.drawText("全 ${notifications.size} 件", center, 223f, footerPaint)
+            // 複数ページのときは総数にページ位置を添える。
+            val footerText = if (pageCount > 1) {
+                "全 ${notifications.size} 件 ${safePage + 1}/$pageCount"
+            } else {
+                "全 ${notifications.size} 件"
+            }
+            canvas.drawText(footerText, center, 223f, footerPaint)
         }
     }
 
